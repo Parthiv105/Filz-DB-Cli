@@ -2,13 +2,21 @@ import { compileColumnSQL, escapeId } from "./schemaBuilder.js";
 import type { ColumnDefinition, TableDefinition } from "./schemaBuilder.js";
 import type { LiveColumnInfo, LiveIndexInfo } from "./schemaInspector.js";
 
-export type ExistingColumnStrategy = "rename" | "keep-names" | "ignore-existing";
+export type ExistingColumnStrategy =
+  | "both"
+  | "rename"
+  | "properties"
+  | "keep-names"
+  | "names"
+  | "only-names"
+  | "ignore-existing";
 
 export interface DiffOptions {
   dropColumns?: boolean;
   strategy?: ExistingColumnStrategy;
   keepNames?: boolean;
   ignoreExisting?: boolean;
+  namesOnly?: boolean;
 }
 
 export interface TableDiffResult {
@@ -203,9 +211,27 @@ export function computeTableDiff(
         continue;
       }
 
+      const isNamesOnly =
+        options.namesOnly ||
+        options.strategy === "names" ||
+        options.strategy === "only-names";
+
+      if (isNamesOnly) {
+        if (matchedLiveName !== modelName) {
+          statements.push(
+            `ALTER TABLE ${escapeId(table.tableName)} RENAME COLUMN ${escapeId(matchedLiveName)} TO ${escapeId(modelName)};`
+          );
+          descriptions.push(
+            `~ Rename column '${matchedLiveName}' -> '${modelName}' (properties unchanged)`
+          );
+        }
+        continue;
+      }
+
       const shouldKeepName =
         options.keepNames ||
         options.strategy === "keep-names" ||
+        options.strategy === "properties" ||
         def.keepName;
 
       if (matchedLiveName !== modelName && !shouldKeepName) {
@@ -242,9 +268,18 @@ export function computeTableDiff(
         options.strategy === "ignore-existing" ||
         def.ignoreExisting;
 
-      if (!isIgnoring) {
+      const isNamesOnly =
+        options.namesOnly ||
+        options.strategy === "names" ||
+        options.strategy === "only-names";
+
+      if (!isIgnoring && !isNamesOnly) {
         const targetColName =
-          (options.keepNames || options.strategy === "keep-names" || def.keepName) && matchedLiveName
+          (options.keepNames ||
+            options.strategy === "keep-names" ||
+            options.strategy === "properties" ||
+            def.keepName) &&
+          matchedLiveName
             ? matchedLiveName
             : modelName;
 

@@ -4,10 +4,10 @@ import { pathToFileURL } from "node:url";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { createDatabasePool } from "./db.js";
-import { compileCreateTableSQL } from "./schemaBuilder.js";
+import { compileCreateTableSQL, escapeId } from "./schemaBuilder.js";
 import type { TableDefinition } from "./schemaBuilder.js";
 import {
-  checkTableExists,
+  fetchAllTables,
   fetchTableColumns,
   fetchTableIndexes,
 } from "./schemaInspector.js";
@@ -28,11 +28,18 @@ export async function runCli(): Promise<void> {
   }
 
   const args = process.argv.slice(2);
+  const isCreateFlag = args.includes("--create") || args.includes("--sync");
   const isAlterFlag = args.includes("--alter");
+  const isDeleteFlag = args.includes("--delete") || args.includes("--drop-table");
   const isDryRunFlag = args.includes("--dry-run");
   const isDropFlag = args.includes("--drop");
+  const isHardFlag = args.includes("--hard") || args.includes("--hard-alter");
   const isKeepNamesFlag =
-    args.includes("--keep-names") || args.includes("--no-rename");
+    args.includes("--keep-names") ||
+    args.includes("--no-rename") ||
+    args.includes("--properties-only");
+  const isNamesOnlyFlag =
+    args.includes("--names-only") || args.includes("--only-names");
   const isIgnoreExistingFlag =
     args.includes("--ignore-existing") || args.includes("--add-only");
   const isNonInteractive =
@@ -40,6 +47,16 @@ export async function runCli(): Promise<void> {
     args.includes("-y") ||
     args.includes("--non-interactive") ||
     args.includes("--ci");
+
+  let tableFilter: string[] | null = null;
+  const tableArgIdx = args.indexOf("--table");
+  if (tableArgIdx !== -1 && args[tableArgIdx + 1]) {
+    tableFilter = [args[tableArgIdx + 1]];
+  }
+  const tablesArgIdx = args.indexOf("--tables");
+  if (tablesArgIdx !== -1 && args[tablesArgIdx + 1]) {
+    tableFilter = args[tablesArgIdx + 1].split(",").map((s) => s.trim());
+  }
 
   let pool: ReturnType<typeof createDatabasePool> | null = null;
   let hasError = false;
@@ -66,50 +83,67 @@ export async function runCli(): Promise<void> {
       modelCandidates.unshift(path.resolve(cwd, args[modelsFlagIdx + 1]));
     }
 
-    let modelFilePath = modelCandidates.find((f) => fs.existsSync(f));
+    const modelFilePath = modelCandidates.find((f) => fs.existsSync(f));
 
-    if (!modelFilePath) {
+    if (!modelFilePath && !isDeleteFlag) {
       p.log.error(
-        `Could not find models registry in project. Checked:\n  - ${modelCandidates.slice(0, 4).join("\n  - ")}\n\nYou can specify custom path using --models <path>`
+        `Could not find models registry in project. Checked:\n  - ${modelCandidates.slice(0, 4).join("\n  - ")}\n\nYou can specify a custom path using --models <path>`
       );
       p.outro(pc.red("Exiting..."));
       process.exit(1);
     }
 
-    const imported = await import(pathToFileURL(modelFilePath).href);
-    const models: TableDefinition[] = imported.models || [];
+    let models: TableDefinition[] = [];
+    if (modelFilePath) {
+      const imported = await import(pathToFileURL(modelFilePath).href);
+      models = imported.models || [];
+    }
 
-    if (!models || models.length === 0) {
+    if ((!models || models.length === 0) && !isDeleteFlag) {
       p.log.warn(`No models exported in: ${modelFilePath}`);
       p.outro(pc.dim("Exiting..."));
       process.exit(0);
     }
 
+    // Connect to MariaDB to fetch live tables
+    const connSpinner = p.spinner();
+    connSpinner.start("Connecting to MariaDB and fetching database tables...");
+
+    pool = createDatabasePool();
+    const liveTableNames = await fetchAllTables(pool);
+
+    connSpinner.stop(
+      `Connected to MariaDB (${liveTableNames.length} table(s) found in database).`
+    );
+
     const isInteractive = !isNonInteractive && Boolean(process.stdin.isTTY);
 
-    let action: "alter" | "sync" | "dry-run" | "exit" = "alter";
-    let strategy: ExistingColumnStrategy = "rename";
-    let dropColumns = false;
+    // 1. First select mode: create, alter, delete
+    let mode: "create" | "alter" | "delete" = isCreateFlag
+      ? "create"
+      : isDeleteFlag
+        ? "delete"
+        : "alter";
 
     if (isInteractive) {
-      const selectedAction = await p.select({
-        message: "What action would you like to perform?",
-        initialValue: isAlterFlag ? "alter" : isDryRunFlag ? "dry-run" : "alter",
+      const selectedMode = await p.select({
+        message: "Select an operation mode:",
+        initialValue: mode,
         options: [
           {
+            value: "create",
+            label: "Create",
+            hint: "Create non-existing tables in the database",
+          },
+          {
             value: "alter",
-            label: "Alter Tables",
-            hint: "Update existing schemas, rename or add columns (recommended)",
+            label: "Alter",
+            hint: "Modify existing tables (Zero data loss or hard alter)",
           },
           {
-            value: "sync",
-            label: "Create Missing Tables",
-            hint: "Only create missing tables without altering existing ones",
-          },
-          {
-            value: "dry-run",
-            label: "Dry Run",
-            hint: "Preview SQL statements without modifying live database",
+            value: "delete",
+            label: "Delete",
+            hint: "Drop existing tables from the database",
           },
           {
             value: "exit",
@@ -119,86 +153,242 @@ export async function runCli(): Promise<void> {
         ],
       });
 
-      if (p.isCancel(selectedAction) || selectedAction === "exit") {
+      if (p.isCancel(selectedMode) || selectedMode === "exit") {
         p.cancel("Operation cancelled. Goodbye!");
         process.exit(0);
       }
 
-      action = selectedAction as "alter" | "sync" | "dry-run" | "exit";
-
-      if (action === "alter" || action === "dry-run") {
-        const selectedStrategy = await p.select({
-          message: "How should existing columns be handled?",
-          initialValue: isIgnoreExistingFlag
-            ? "ignore-existing"
-            : isKeepNamesFlag
-              ? "keep-names"
-              : "rename",
-          options: [
-            {
-              value: "rename",
-              label: "Rename & Update (Zero Data Loss)",
-              hint: "Smart rename old columns to model names, update types/collations",
-            },
-            {
-              value: "keep-names",
-              label: "Keep Old Column Names",
-              hint: "Preserve database column names, only update types/collations",
-            },
-            {
-              value: "ignore-existing",
-              label: "Ignore Existing Columns",
-              hint: "Leave all existing columns untouched; only add new columns",
-            },
-          ],
-        });
-
-        if (p.isCancel(selectedStrategy)) {
-          p.cancel("Operation cancelled.");
-          process.exit(0);
-        }
-
-        strategy = selectedStrategy as ExistingColumnStrategy;
-
-        const selectedDrop = await p.select({
-          message: "Drop extra database columns not present in your models?",
-          initialValue: isDropFlag,
-          options: [
-            {
-              value: false,
-              label: "No (Safe)",
-              hint: "Keep extra database columns untouched",
-            },
-            {
-              value: true,
-              label: "Yes (Caution)",
-              hint: "Drop columns from DB that are not defined in models",
-            },
-          ],
-        });
-
-        if (p.isCancel(selectedDrop)) {
-          p.cancel("Operation cancelled.");
-          process.exit(0);
-        }
-
-        dropColumns = selectedDrop as boolean;
-      }
-    } else {
-      action = isDryRunFlag ? "dry-run" : isAlterFlag ? "alter" : "sync";
-      strategy = isIgnoreExistingFlag
-        ? "ignore-existing"
-        : isKeepNamesFlag
-          ? "keep-names"
-          : "rename";
-      dropColumns = isDropFlag;
+      mode = selectedMode as "create" | "alter" | "delete";
     }
 
-    const s = p.spinner();
-    s.start("Connecting to MariaDB and analyzing live schemas...");
+    // 2. Select table/tables based on mode:
+    // - create: only show non-existing tables in db
+    // - alter: only show existing tables in db
+    // - delete: only show existing tables in db
+    let selectedTableNames: string[] = [];
 
-    pool = createDatabasePool();
+    if (mode === "create") {
+      const nonExistingModelTables = models.filter(
+        (m) =>
+          !liveTableNames.some(
+            (lt) => lt.toLowerCase() === m.tableName.toLowerCase()
+          )
+      );
 
+      if (nonExistingModelTables.length === 0) {
+        p.log.info(
+          pc.cyan(
+            "All model tables already exist in the database! There are no tables to create."
+          )
+        );
+        p.outro(pc.green("Database is up to date."));
+        return;
+      }
+
+      if (isInteractive) {
+        const selected = await p.multiselect({
+          message: "Select table(s) to create:",
+          options: nonExistingModelTables.map((t) => ({
+            value: t.tableName,
+            label: t.tableName,
+            hint: `${Object.keys(t.columns).length} column(s) defined`,
+          })),
+          initialValues: nonExistingModelTables.map((t) => t.tableName),
+          required: true,
+        });
+
+        if (p.isCancel(selected)) {
+          p.cancel("Operation cancelled.");
+          process.exit(0);
+        }
+
+        selectedTableNames = selected as string[];
+      } else {
+        selectedTableNames = tableFilter
+          ? nonExistingModelTables
+              .filter((t) => tableFilter!.includes(t.tableName))
+              .map((t) => t.tableName)
+          : nonExistingModelTables.map((t) => t.tableName);
+      }
+    } else if (mode === "alter") {
+      const existingModelTables = models.filter((m) =>
+        liveTableNames.some(
+          (lt) => lt.toLowerCase() === m.tableName.toLowerCase()
+        )
+      );
+
+      if (existingModelTables.length === 0) {
+        p.log.warn(
+          pc.yellow(
+            "No model tables exist in the database yet. Use 'Create' mode to create them first."
+          )
+        );
+        p.outro(pc.dim("Exiting..."));
+        return;
+      }
+
+      if (isInteractive) {
+        const selected = await p.multiselect({
+          message: "Select table(s) to alter:",
+          options: existingModelTables.map((t) => ({
+            value: t.tableName,
+            label: t.tableName,
+            hint: `${Object.keys(t.columns).length} column(s) in model`,
+          })),
+          initialValues: existingModelTables.map((t) => t.tableName),
+          required: true,
+        });
+
+        if (p.isCancel(selected)) {
+          p.cancel("Operation cancelled.");
+          process.exit(0);
+        }
+
+        selectedTableNames = selected as string[];
+      } else {
+        selectedTableNames = tableFilter
+          ? existingModelTables
+              .filter((t) => tableFilter!.includes(t.tableName))
+              .map((t) => t.tableName)
+          : existingModelTables.map((t) => t.tableName);
+      }
+    } else if (mode === "delete") {
+      if (liveTableNames.length === 0) {
+        p.log.warn(pc.yellow("No tables found in the database to delete."));
+        p.outro(pc.dim("Exiting..."));
+        return;
+      }
+
+      if (isInteractive) {
+        const selected = await p.multiselect({
+          message: "Select table(s) to delete (DROP):",
+          options: liveTableNames.map((tbl) => {
+            const matchesModel = models.some(
+              (m) => m.tableName.toLowerCase() === tbl.toLowerCase()
+            );
+            return {
+              value: tbl,
+              label: tbl,
+              hint: matchesModel ? "defined in models" : "in database only",
+            };
+          }),
+          required: true,
+        });
+
+        if (p.isCancel(selected)) {
+          p.cancel("Operation cancelled.");
+          process.exit(0);
+        }
+
+        selectedTableNames = selected as string[];
+      } else {
+        if (!tableFilter || tableFilter.length === 0) {
+          p.log.error(
+            "Non-interactive delete requires --table <name> or --tables <list>"
+          );
+          process.exit(1);
+        }
+        selectedTableNames = liveTableNames.filter((t) =>
+          tableFilter!.includes(t)
+        );
+      }
+    }
+
+    if (selectedTableNames.length === 0) {
+      p.log.warn("No tables were selected.");
+      p.outro(pc.dim("Exiting..."));
+      return;
+    }
+
+    // 3. Select related options:
+    // hard alter (drop table first and create from scratch) || only alter names || only col property || both
+    let alterOption: "both" | "properties" | "names" | "hard" = "both";
+    let dropColumns = false;
+
+    if (mode === "alter") {
+      if (isInteractive) {
+        const selectedAlterOption = await p.select({
+          message: "Select alteration method / strategy:",
+          initialValue: isHardFlag
+            ? "hard"
+            : isNamesOnlyFlag
+              ? "names"
+              : isKeepNamesFlag
+                ? "properties"
+                : "both",
+          options: [
+            {
+              value: "both",
+              label: "Both (Rename & Column Properties)",
+              hint: "Smart rename old columns to model names AND update types/properties (Zero Data Loss)",
+            },
+            {
+              value: "properties",
+              label: "Only Column Properties",
+              hint: "Preserve database column names; only update data types, collations, and defaults",
+            },
+            {
+              value: "names",
+              label: "Only Alter Names",
+              hint: "Only rename columns to model names; keep existing types and properties unchanged",
+            },
+            {
+              value: "hard",
+              label: "Hard Alter (Drop & Recreate)",
+              hint: "DROP table first and create fresh from model (Destroys all existing table data!)",
+            },
+          ],
+        });
+
+        if (p.isCancel(selectedAlterOption)) {
+          p.cancel("Operation cancelled.");
+          process.exit(0);
+        }
+
+        alterOption = selectedAlterOption as
+          | "both"
+          | "properties"
+          | "names"
+          | "hard";
+
+        if (alterOption !== "hard") {
+          const selectedDrop = await p.select({
+            message: "Drop extra database columns not present in your models?",
+            initialValue: isDropFlag,
+            options: [
+              {
+                value: false,
+                label: "No (Safe)",
+                hint: "Keep extra database columns untouched",
+              },
+              {
+                value: true,
+                label: "Yes (Caution)",
+                hint: "Drop columns from DB that are not defined in models",
+              },
+            ],
+          });
+
+          if (p.isCancel(selectedDrop)) {
+            p.cancel("Operation cancelled.");
+            process.exit(0);
+          }
+
+          dropColumns = selectedDrop as boolean;
+        }
+      } else {
+        alterOption = isHardFlag
+          ? "hard"
+          : isNamesOnlyFlag
+            ? "names"
+            : isKeepNamesFlag
+              ? "properties"
+              : "both";
+        dropColumns = isDropFlag;
+      }
+    }
+
+    // 4. Compute changes, display all changes, and confirm from user
     const toCreate: { table: TableDefinition; sql: string }[] = [];
     const toAlter: {
       table: TableDefinition;
@@ -206,51 +396,107 @@ export async function runCli(): Promise<void> {
       descriptions: string[];
       warnings: string[];
     }[] = [];
+    const toDelete: { tableName: string; sql: string }[] = [];
     const upToDateTables: string[] = [];
-    const skippedExistingTables: string[] = [];
 
-    for (const table of models) {
-      const exists = await checkTableExists(pool, table.tableName);
-
-      if (!exists) {
-        const createSQL = compileCreateTableSQL(table);
-        toCreate.push({ table, sql: createSQL });
-        continue;
-      }
-
-      if (action === "sync") {
-        skippedExistingTables.push(table.tableName);
-        continue;
-      }
-
-      const liveColumns = await fetchTableColumns(pool, table.tableName);
-      const liveIndexes = await fetchTableIndexes(pool, table.tableName);
-
-      const diff = computeTableDiff(table, liveColumns, liveIndexes, {
-        dropColumns,
-        strategy,
-      });
-
-      if (diff.statements.length > 0) {
-        toAlter.push({
+    if (mode === "create") {
+      for (const name of selectedTableNames) {
+        const table = models.find(
+          (m) => m.tableName.toLowerCase() === name.toLowerCase()
+        )!;
+        toCreate.push({
           table,
-          statements: diff.statements,
-          descriptions: diff.descriptions,
-          warnings: diff.warnings,
+          sql: compileCreateTableSQL(table),
         });
+      }
+    } else if (mode === "alter") {
+      if (alterOption === "hard") {
+        for (const name of selectedTableNames) {
+          const table = models.find(
+            (m) => m.tableName.toLowerCase() === name.toLowerCase()
+          )!;
+          toAlter.push({
+            table,
+            statements: [
+              `DROP TABLE IF EXISTS ${escapeId(table.tableName)};`,
+              compileCreateTableSQL(table),
+            ],
+            descriptions: [
+              `! DROP TABLE ${escapeId(table.tableName)} (All existing records will be destroyed)`,
+              `+ CREATE TABLE ${escapeId(table.tableName)} fresh from model schema`,
+            ],
+            warnings: [
+              `Hard alter permanently drops table '${table.tableName}' and destroys all its data!`,
+            ],
+          });
+        }
       } else {
-        upToDateTables.push(table.tableName);
+        const diffSpinner = p.spinner();
+        diffSpinner.start(
+          "Analyzing schema differences for selected table(s)..."
+        );
+
+        let diffStrategy: ExistingColumnStrategy = "rename";
+        if (isIgnoreExistingFlag) {
+          diffStrategy = "ignore-existing";
+        } else if (alterOption === "properties") {
+          diffStrategy = "properties";
+        } else if (alterOption === "names") {
+          diffStrategy = "names";
+        } else {
+          diffStrategy = "both";
+        }
+
+        for (const name of selectedTableNames) {
+          const table = models.find(
+            (m) => m.tableName.toLowerCase() === name.toLowerCase()
+          )!;
+          const liveColumns = await fetchTableColumns(pool, table.tableName);
+          const liveIndexes = await fetchTableIndexes(pool, table.tableName);
+
+          const diff = computeTableDiff(table, liveColumns, liveIndexes, {
+            dropColumns,
+            strategy: diffStrategy,
+          });
+
+          if (diff.statements.length > 0) {
+            toAlter.push({
+              table,
+              statements: diff.statements,
+              descriptions: diff.descriptions,
+              warnings: diff.warnings,
+            });
+          } else {
+            upToDateTables.push(table.tableName);
+          }
+        }
+
+        diffSpinner.stop("Schema diff analysis completed.");
+      }
+    } else if (mode === "delete") {
+      for (const name of selectedTableNames) {
+        toDelete.push({
+          tableName: name,
+          sql: `DROP TABLE IF EXISTS ${escapeId(name)};`,
+        });
       }
     }
 
-    s.stop("Schema analysis completed.");
+    const totalChanges =
+      toCreate.length +
+      toDelete.length +
+      toAlter.reduce((acc, curr) => acc + curr.statements.length, 0);
 
-    if (toCreate.length === 0 && toAlter.length === 0) {
-      p.log.success(
-        pc.green(
-          `All tables are up to date! (${models.map((m) => m.tableName).join(", ")})`
-        )
-      );
+    if (totalChanges === 0) {
+      if (upToDateTables.length > 0) {
+        p.log.success(
+          pc.green(
+            `All selected tables are up to date! (${upToDateTables.join(", ")})`
+          )
+        );
+      } else {
+        p.log.info(pc.cyan("No changes to perform."));
+      }
       p.outro(pc.cyan("Database synchronized!"));
       return;
     }
@@ -260,21 +506,39 @@ export async function runCli(): Promise<void> {
     if (toCreate.length > 0) {
       summaryLines.push(pc.bold(pc.green("Tables to create:")));
       for (const item of toCreate) {
-        summaryLines.push(`  + CREATE TABLE ${pc.cyan(item.table.tableName)}`);
+        summaryLines.push(
+          `  + CREATE TABLE ${pc.cyan(item.table.tableName)} (${Object.keys(item.table.columns).length} columns)`
+        );
       }
       summaryLines.push("");
     }
 
     if (toAlter.length > 0) {
-      summaryLines.push(pc.bold(pc.yellow("Tables to alter:")));
+      summaryLines.push(
+        pc.bold(
+          alterOption === "hard"
+            ? pc.red("Tables to drop & recreate (Hard Alter):")
+            : pc.yellow("Tables to alter:")
+        )
+      );
       for (const item of toAlter) {
         summaryLines.push(`  Table ${pc.cyan(item.table.tableName)}:`);
         for (const desc of item.descriptions) {
           summaryLines.push(`    ${desc}`);
         }
         for (const warn of item.warnings) {
-          summaryLines.push(`    ${pc.yellow(`[WARN] ${warn}`)}`);
+          summaryLines.push(`    ${pc.red(`[WARN] ${warn}`)}`);
         }
+      }
+      summaryLines.push("");
+    }
+
+    if (toDelete.length > 0) {
+      summaryLines.push(pc.bold(pc.red("Tables to delete (DROP):")));
+      for (const item of toDelete) {
+        summaryLines.push(
+          `  - DROP TABLE ${pc.red(pc.bold(item.tableName))} (All data will be permanently deleted)`
+        );
       }
       summaryLines.push("");
     }
@@ -285,44 +549,47 @@ export async function runCli(): Promise<void> {
       );
     }
 
-    if (skippedExistingTables.length > 0) {
-      summaryLines.push(
-        pc.dim(
-          `Existing tables skipped (sync mode): ${skippedExistingTables.join(", ")}`
-        )
-      );
-    }
-
     p.note(summaryLines.join("\n").trim(), "Proposed Schema Changes");
 
-    if (action === "dry-run") {
-      const sqlLines: string[] = [];
-      for (const item of toCreate) {
-        sqlLines.push(item.sql);
-      }
-      for (const item of toAlter) {
-        sqlLines.push(...item.statements);
-      }
+    const allSqlLines: string[] = [];
+    for (const item of toCreate) {
+      allSqlLines.push(item.sql);
+    }
+    for (const item of toAlter) {
+      allSqlLines.push(...item.statements);
+    }
+    for (const item of toDelete) {
+      allSqlLines.push(item.sql);
+    }
 
-      p.note(sqlLines.join("\n\n"), "Generated SQL (Dry Run)");
+    p.note(allSqlLines.join("\n\n"), "Generated SQL Preview");
+
+    if (isDryRunFlag) {
       p.outro(
         pc.yellow("Dry run complete. No changes were executed in your database.")
       );
       return;
     }
 
-    const totalChanges =
-      toCreate.length +
-      toAlter.reduce((acc, curr) => acc + curr.statements.length, 0);
-
     if (isInteractive) {
+      const isDestructive =
+        mode === "delete" || alterOption === "hard" || dropColumns;
+
+      const confirmMsg = isDestructive
+        ? pc.red(
+            pc.bold(
+              `Execute ${totalChanges} schema change(s) including DESTRUCTIVE actions in your MariaDB database?`
+            )
+          )
+        : `Execute ${totalChanges} schema change(s) in your live MariaDB database?`;
+
       const proceed = await p.confirm({
-        message: `Execute ${totalChanges} schema change(s) in your live MariaDB database?`,
-        initialValue: true,
+        message: confirmMsg,
+        initialValue: !isDestructive,
       });
 
       if (p.isCancel(proceed) || !proceed) {
-        p.cancel("Migration cancelled. No changes were applied.");
+        p.cancel("Operation cancelled. No changes were applied.");
         process.exit(0);
       }
     }
@@ -339,7 +606,16 @@ export async function runCli(): Promise<void> {
       for (const sql of item.statements) {
         await pool.query(sql);
       }
-      p.log.success(`Altered table '${item.table.tableName}'`);
+      if (alterOption === "hard") {
+        p.log.success(`Dropped and recreated table '${item.table.tableName}'`);
+      } else {
+        p.log.success(`Altered table '${item.table.tableName}'`);
+      }
+    }
+
+    for (const item of toDelete) {
+      await pool.query(item.sql);
+      p.log.success(`Dropped table '${item.tableName}'`);
     }
 
     execSpinner.stop("All changes successfully executed!");
@@ -347,7 +623,7 @@ export async function runCli(): Promise<void> {
     p.outro(
       pc.green(
         pc.bold(
-          `Success! ${toCreate.length} created, ${toAlter.length} altered. Database is now in sync!`
+          `Success! Executed ${totalChanges} change(s). Database is now in sync!`
         )
       )
     );
@@ -375,4 +651,3 @@ export async function runCli(): Promise<void> {
     process.exit(hasError ? 1 : 0);
   }
 }
-

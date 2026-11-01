@@ -199,21 +199,390 @@ export const col = {
   },
 };
 
+export interface TableOptions {
+  timestamps?: boolean | { createdAt?: string; updatedAt?: string };
+  engine?: string;
+  charset?: string;
+  collation?: string;
+  comment?: string;
+}
+
+export type SupportedType =
+  | StringConstructor
+  | NumberConstructor
+  | BooleanConstructor
+  | DateConstructor
+  | ObjectConstructor
+  | ArrayConstructor
+  | DataType
+  | "string"
+  | "varchar"
+  | "number"
+  | "int"
+  | "integer"
+  | "bigint"
+  | "smallint"
+  | "tinyint"
+  | "boolean"
+  | "bool"
+  | "date"
+  | "datetime"
+  | "timestamp"
+  | "apiKey"
+  | "apikey"
+  | "uuid"
+  | "json"
+  | "text"
+  | "tinytext"
+  | "mediumtext"
+  | "longtext"
+  | "blob"
+  | "tinyblob"
+  | "mediumblob"
+  | "longblob"
+  | "decimal"
+  | "float"
+  | "double"
+  | "enum"
+  | any[];
+
+export interface FieldOptions {
+  type: SupportedType;
+  length?: number | string;
+  maxlength?: number | string;
+  size?: number | string;
+  precision?: number;
+  scale?: number;
+  required?: boolean;
+  nullable?: boolean;
+  primaryKey?: boolean;
+  primary?: boolean;
+  id?: boolean;
+  autoIncrement?: boolean;
+  auto?: boolean;
+  unique?: boolean;
+  unsigned?: boolean;
+  default?: string | number | boolean | null;
+  defaultValue?: string | number | boolean | null;
+  enum?: string[];
+  enumValues?: string[];
+  charset?: string;
+  collate?: string;
+  collation?: string;
+  caseSensitive?: boolean;
+  comment?: string;
+  from?: string;
+  renamedFrom?: string;
+  keepName?: boolean;
+  ignoreExisting?: boolean;
+  onUpdate?: string;
+  onUpdateCurrentTimestamp?: boolean;
+  customType?: string;
+  text?: boolean;
+}
+
+export type FieldDefinitionInput =
+  | ColumnBuilder
+  | FieldOptions
+  | StringConstructor
+  | NumberConstructor
+  | BooleanConstructor
+  | DateConstructor
+  | ObjectConstructor
+  | ArrayConstructor
+  | DataType
+  | any[];
+
+export const Types = {
+  String,
+  Number,
+  Boolean,
+  Date,
+  Buffer,
+  Array,
+  Object,
+  ObjectId: "UUID" as const,
+  UUID: "UUID" as const,
+  Mixed: "JSON" as const,
+  JSON: "JSON" as const,
+  ApiKey: "apiKey" as const,
+  Int: "INT" as const,
+  BigInt: "BIGINT" as const,
+  TinyInt: "TINYINT" as const,
+  Text: "TEXT" as const,
+  LongText: "LONGTEXT" as const,
+  Decimal: "DECIMAL" as const,
+  Float: "FLOAT" as const,
+  Double: "DOUBLE" as const,
+};
+
+export class Schema {
+  fields: Record<string, FieldDefinitionInput>;
+  options: TableOptions;
+
+  static Types = Types;
+
+  constructor(
+    fields: Record<string, FieldDefinitionInput>,
+    options: TableOptions = {}
+  ) {
+    this.fields = fields;
+    this.options = options;
+  }
+}
+
+export function normalizeFieldDefinition(
+  input: FieldDefinitionInput
+): ColumnDefinition {
+  if (input instanceof ColumnBuilder) {
+    return input.def;
+  }
+
+  // Handle direct constructor primitives
+  if (input === String) {
+    return new ColumnBuilder("VARCHAR", 255).def;
+  }
+  if (input === Number) {
+    return new ColumnBuilder("INT").def;
+  }
+  if (input === Boolean) {
+    return new ColumnBuilder("TINYINT", 1).def;
+  }
+  if (input === Date) {
+    return new ColumnBuilder("DATETIME").def;
+  }
+  if (input === Object) {
+    return new ColumnBuilder("JSON").def;
+  }
+  if (input === Array || Array.isArray(input)) {
+    return new ColumnBuilder("JSON").def;
+  }
+  if (typeof Buffer !== "undefined" && (input as any) === Buffer) {
+    return new ColumnBuilder("BLOB").def;
+  }
+
+  // Handle string data types like "INT" or "VARCHAR"
+  if (typeof input === "string") {
+    const upper = input.toUpperCase();
+    if (upper === "APIKEY") {
+      return new ColumnBuilder("VARCHAR", 64).caseSensitive().def;
+    }
+    return new ColumnBuilder(upper as DataType).def;
+  }
+
+  // Handle FieldOptions object: { type: ... }
+  if (typeof input === "object" && input !== null) {
+    const opts = input as FieldOptions;
+    const typeVal = opts.type;
+    let length: number | string | undefined =
+      opts.length ?? opts.maxlength ?? opts.size;
+    let baseType: DataType = "VARCHAR";
+    let isApiKey = false;
+    const customType = opts.customType;
+    const enumValues: string[] | undefined = opts.enum ?? opts.enumValues;
+
+    if (Array.isArray(typeVal)) {
+      baseType = "JSON";
+    } else if (typeVal === String) {
+      if (opts.text || length === "text" || (typeof length === "number" && length > 65535)) {
+        baseType = "TEXT";
+        length = undefined;
+      } else {
+        baseType = "VARCHAR";
+        length = length ?? 255;
+      }
+    } else if (typeVal === Number) {
+      if (opts.precision !== undefined && opts.scale !== undefined) {
+        baseType = "DECIMAL";
+        length = `${opts.precision}, ${opts.scale}`;
+      } else {
+        baseType = "INT";
+      }
+    } else if (typeVal === Boolean) {
+      baseType = "TINYINT";
+      length = 1;
+    } else if (typeVal === Date) {
+      baseType = "DATETIME";
+    } else if (typeVal === Object) {
+      baseType = "JSON";
+    } else if (typeVal === Array) {
+      baseType = "JSON";
+    } else if (typeof Buffer !== "undefined" && (typeVal as any) === Buffer) {
+      baseType = "BLOB";
+    } else if (typeof typeVal === "string") {
+      const lower = typeVal.toLowerCase();
+      if (lower === "apikey") {
+        baseType = "VARCHAR";
+        length = length ?? 64;
+        isApiKey = true;
+      } else if (lower === "string" || lower === "varchar") {
+        baseType = "VARCHAR";
+        length = length ?? 255;
+      } else if (lower === "int" || lower === "integer" || lower === "number") {
+        baseType = "INT";
+      } else if (lower === "bigint") {
+        baseType = "BIGINT";
+      } else if (lower === "smallint") {
+        baseType = "SMALLINT";
+      } else if (lower === "tinyint") {
+        baseType = "TINYINT";
+        length = length ?? 1;
+      } else if (lower === "boolean" || lower === "bool") {
+        baseType = "TINYINT";
+        length = 1;
+      } else if (lower === "date") {
+        baseType = "DATE";
+      } else if (lower === "datetime") {
+        baseType = "DATETIME";
+      } else if (lower === "timestamp") {
+        baseType = "TIMESTAMP";
+      } else if (lower === "text") {
+        baseType = "TEXT";
+      } else if (lower === "longtext") {
+        baseType = "LONGTEXT";
+      } else if (lower === "mediumtext") {
+        baseType = "MEDIUMTEXT";
+      } else if (lower === "tinytext") {
+        baseType = "TINYTEXT";
+      } else if (lower === "blob") {
+        baseType = "BLOB";
+      } else if (lower === "uuid" || lower === "objectid") {
+        baseType = "UUID";
+      } else if (lower === "json" || lower === "mixed") {
+        baseType = "JSON";
+      } else if (lower === "decimal") {
+        baseType = "DECIMAL";
+        if (opts.precision !== undefined && opts.scale !== undefined) {
+          length = `${opts.precision}, ${opts.scale}`;
+        } else {
+          length = length ?? "10, 2";
+        }
+      } else if (lower === "float") {
+        baseType = "FLOAT";
+      } else if (lower === "double") {
+        baseType = "DOUBLE";
+      } else if (lower === "enum") {
+        baseType = "ENUM";
+      } else {
+        baseType = typeVal.toUpperCase() as DataType;
+      }
+    }
+
+    const isPrimaryKey = Boolean(opts.primaryKey || opts.primary || opts.id);
+    const isAutoIncrement = Boolean(opts.autoIncrement || opts.auto);
+    const isUnique = Boolean(opts.unique);
+    const isUnsigned = Boolean(opts.unsigned);
+
+    let nullable = true;
+    if (isPrimaryKey) {
+      nullable = false;
+    } else if (opts.required !== undefined) {
+      nullable = !opts.required;
+    } else if (opts.nullable !== undefined) {
+      nullable = opts.nullable;
+    }
+
+    let collation = opts.collation ?? opts.collate;
+    if (isApiKey || opts.caseSensitive) {
+      collation = "utf8mb4_bin";
+    }
+
+    let onUpdate = opts.onUpdate;
+    if (opts.onUpdateCurrentTimestamp) {
+      onUpdate = "CURRENT_TIMESTAMP";
+    }
+
+    const defaultValue =
+      opts.default !== undefined ? opts.default : opts.defaultValue;
+
+    return {
+      type: baseType,
+      customType,
+      length,
+      enumValues,
+      nullable,
+      isPrimaryKey,
+      isAutoIncrement,
+      isUnique,
+      isUnsigned: isUnsigned ? true : undefined,
+      charset: opts.charset,
+      collation,
+      defaultValue,
+      onUpdate,
+      comment: opts.comment,
+      renamedFrom: opts.from ?? opts.renamedFrom,
+      keepName: opts.keepName,
+      ignoreExisting: opts.ignoreExisting,
+    };
+  }
+
+  return new ColumnBuilder("VARCHAR", 255).def;
+}
+
 export interface TableDefinition {
   tableName: string;
   columns: Record<string, ColumnDefinition>;
+  options?: TableOptions;
 }
 
 export function defineTable(
   tableName: string,
-  columnsConfig: Record<string, ColumnBuilder>
+  schemaOrColumns: Record<string, FieldDefinitionInput> | Schema,
+  options?: TableOptions
 ): TableDefinition {
+  const fields =
+    schemaOrColumns instanceof Schema
+      ? schemaOrColumns.fields
+      : schemaOrColumns;
+
+  const mergedOptions: TableOptions = {
+    ...(schemaOrColumns instanceof Schema ? schemaOrColumns.options : {}),
+    ...(options || {}),
+  };
+
   const columns: Record<string, ColumnDefinition> = {};
-  for (const key of Object.keys(columnsConfig)) {
-    columns[key] = columnsConfig[key].def;
+  for (const key of Object.keys(fields)) {
+    columns[key] = normalizeFieldDefinition(fields[key]);
   }
-  return { tableName, columns };
+
+  // Handle timestamps: true (Mongoose-style)
+  if (mergedOptions.timestamps) {
+    const keys = Object.keys(columns);
+    const hasPascalCase = keys.some((k) => /^[A-Z]/.test(k));
+
+    let createdKey = hasPascalCase ? "CreatedAt" : "createdAt";
+    let updatedKey = hasPascalCase ? "UpdatedAt" : "updatedAt";
+
+    if (typeof mergedOptions.timestamps === "object") {
+      if (mergedOptions.timestamps.createdAt) {
+        createdKey = mergedOptions.timestamps.createdAt;
+      }
+      if (mergedOptions.timestamps.updatedAt) {
+        updatedKey = mergedOptions.timestamps.updatedAt;
+      }
+    }
+
+    if (!columns[createdKey]) {
+      columns[createdKey] = new ColumnBuilder("TIMESTAMP")
+        .default("CURRENT_TIMESTAMP")
+        .def;
+    }
+
+    if (!columns[updatedKey]) {
+      columns[updatedKey] = new ColumnBuilder("TIMESTAMP")
+        .default("CURRENT_TIMESTAMP")
+        .onUpdateCurrentTimestamp()
+        .def;
+    }
+  }
+
+  return { tableName, columns, options: mergedOptions };
 }
+
+// Aliases matching Mongoose / MongoDB convention
+export const defineModel = defineTable;
+export const createModel = defineTable;
+export const model = defineTable;
 
 export function escapeId(identifier: string): string {
   return `\`${identifier.replace(/`/g, "``")}\``;
@@ -319,8 +688,15 @@ export function compileCreateTableSQL(table: TableDefinition): string {
     colLines.push(`  UNIQUE KEY ${escapeId(uq.name)} (${escapeId(uq.col)})`);
   }
 
+  const engine = table.options?.engine || "InnoDB";
+  const charset = table.options?.charset || "utf8mb4";
+  const collation = table.options?.collation || "utf8mb4_unicode_ci";
+  const comment = table.options?.comment
+    ? ` COMMENT=${escapeLiteral(table.options.comment)}`
+    : "";
+
   return `CREATE TABLE IF NOT EXISTS ${escapeId(table.tableName)} (\n${colLines.join(
     ",\n"
-  )}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;`;
+  )}\n) ENGINE=${engine} DEFAULT CHARSET=${charset} COLLATE=${collation}${comment};`;
 }
 

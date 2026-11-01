@@ -20,6 +20,15 @@ export interface DatabaseExecutor {
   query: <T = unknown>(sql: string, values?: unknown[]) => Promise<T>;
 }
 
+export async function fetchAllTables(
+  db: DatabaseExecutor
+): Promise<string[]> {
+  const rows = await db.query<Array<{ TABLE_NAME: string }>>(
+    "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE != 'VIEW' ORDER BY TABLE_NAME"
+  );
+  return (rows || []).map((r) => r.TABLE_NAME);
+}
+
 export async function checkTableExists(
   db: DatabaseExecutor,
   tableName: string
