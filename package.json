@@ -1,6 +1,6 @@
 {
   "name": "@bossdev/db-modeler",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Declarative MariaDB schema synchronizer & migration CLI with interactive UI",
   "type": "module",
   "main": "./dist/index.js",
