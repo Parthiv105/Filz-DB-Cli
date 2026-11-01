@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { createDatabasePool } from "./db.js";
+import { createDatabasePool, ensureDatabaseExists } from "./db.js";
 import { compileCreateTableSQL, escapeId } from "./schemaBuilder.js";
 import type { TableDefinition } from "./schemaBuilder.js";
 import {
@@ -109,6 +109,7 @@ export async function runCli(): Promise<void> {
     const connSpinner = p.spinner();
     connSpinner.start("Connecting to MariaDB and fetching database tables...");
 
+    await ensureDatabaseExists();
     pool = createDatabasePool();
     const liveTableNames = await fetchAllTables(pool);
 
