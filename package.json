@@ -1,0 +1,44 @@
+{
+  "name": "@bossdev/db-modeler",
+  "version": "1.0.1",
+  "description": "Declarative MariaDB schema synchronizer & migration CLI with interactive UI",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "db-modeler": "./bin/cli.mjs",
+    "db-modler": "./bin/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "cli": "node bin/cli.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mariadb",
+    "schema",
+    "sync",
+    "migrations",
+    "cli",
+    "typescript"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "mariadb": "^3.5.4",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "tsx": "^4.23.15",
+    "typescript": "^5"
+  }
+}
