@@ -3,7 +3,12 @@ import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { createDatabasePool, ensureDatabaseExists } from "./db.js";
+import {
+  checkDatabaseExists,
+  createDatabase,
+  createDatabasePool,
+  getResolvedDatabaseName,
+} from "./db.js";
 import { compileCreateTableSQL, escapeId } from "./schemaBuilder.js";
 import type { TableDefinition } from "./schemaBuilder.js";
 import {
@@ -105,16 +110,47 @@ export async function runCli(): Promise<void> {
       process.exit(0);
     }
 
-    // Connect to MariaDB to fetch live tables
+    // Connect to MariaDB and check database existence
     const connSpinner = p.spinner();
-    connSpinner.start("Connecting to MariaDB and fetching database tables...");
+    connSpinner.start("Connecting to MariaDB...");
 
-    await ensureDatabaseExists();
+    const targetDbName = getResolvedDatabaseName();
+    const dbExists = await checkDatabaseExists();
+
+    if (!dbExists) {
+      connSpinner.stop(pc.yellow(`Database '${targetDbName}' does not exist.`));
+
+      const isInteractivePrompt = !isNonInteractive && Boolean(process.stdin.isTTY);
+      if (!isInteractivePrompt) {
+        p.log.warn(`Database '${targetDbName}' not found. Creating in non-interactive mode...`);
+        await createDatabase();
+      } else {
+        const shouldCreate = await p.confirm({
+          message: `Database '${targetDbName}' does not exist. Would you like to create it now?`,
+          initialValue: true,
+        });
+
+        if (p.isCancel(shouldCreate) || !shouldCreate) {
+          p.cancel("Operation cancelled. Please create the database first before running migrations.");
+          process.exit(0);
+        }
+
+        const createSpinner = p.spinner();
+        createSpinner.start(`Creating database '${targetDbName}'...`);
+        await createDatabase();
+        createSpinner.stop(pc.green(`Database '${targetDbName}' created successfully!`));
+      }
+    } else {
+      connSpinner.stop(pc.green(`Connected to MariaDB.`));
+    }
+
+    const fetchSpinner = p.spinner();
+    fetchSpinner.start("Fetching live database tables...");
     pool = createDatabasePool();
     const liveTableNames = await fetchAllTables(pool);
 
-    connSpinner.stop(
-      `Connected to MariaDB (${liveTableNames.length} table(s) found in database).`
+    fetchSpinner.stop(
+      `Database '${targetDbName}' ready (${liveTableNames.length} table(s) found).`
     );
 
     const isInteractive = !isNonInteractive && Boolean(process.stdin.isTTY);

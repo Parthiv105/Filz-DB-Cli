@@ -17,9 +17,10 @@ function parseDatabaseUrl(urlStr: string): Partial<PoolConfig> {
   }
 }
 
-export async function ensureDatabaseExists(
-  overrideConfig: Partial<PoolConfig> = {}
-): Promise<void> {
+function getServerConfig(overrideConfig: Partial<PoolConfig> = {}): {
+  serverConfig: ConnectionConfig;
+  databaseName: string;
+} {
   let urlConfig: Partial<PoolConfig> = {};
   if (process.env.DATABASE_URL) {
     urlConfig = parseDatabaseUrl(process.env.DATABASE_URL);
@@ -29,11 +30,8 @@ export async function ensureDatabaseExists(
     overrideConfig.database ||
     urlConfig.database ||
     process.env.DB_NAME ||
-    process.env.MARIADB_DATABASE;
-
-  if (!databaseName) {
-    return;
-  }
+    process.env.MARIADB_DATABASE ||
+    "filz";
 
   const serverConfig: ConnectionConfig = {
     host:
@@ -62,6 +60,44 @@ export async function ensureDatabaseExists(
     ...(process.env.DB_SOCKET ? { socketPath: process.env.DB_SOCKET } : {}),
   };
 
+  return { serverConfig, databaseName };
+}
+
+export function getResolvedDatabaseName(
+  overrideConfig: Partial<PoolConfig> = {}
+): string {
+  const { databaseName } = getServerConfig(overrideConfig);
+  return databaseName;
+}
+
+export async function checkDatabaseExists(
+  overrideConfig: Partial<PoolConfig> = {}
+): Promise<boolean> {
+  const { serverConfig, databaseName } = getServerConfig(overrideConfig);
+  let conn: Connection | undefined;
+  try {
+    conn = await mariadb.createConnection({
+      ...serverConfig,
+      database: databaseName,
+    });
+    return true;
+  } catch (err: unknown) {
+    const error = err as { errno?: number; code?: string };
+    if (error?.errno === 1049 || error?.code === "ER_BAD_DB_ERROR") {
+      return false;
+    }
+    throw err;
+  } finally {
+    if (conn) {
+      await conn.end();
+    }
+  }
+}
+
+export async function createDatabase(
+  overrideConfig: Partial<PoolConfig> = {}
+): Promise<void> {
+  const { serverConfig, databaseName } = getServerConfig(overrideConfig);
   let conn: Connection | undefined;
   try {
     conn = await mariadb.createConnection(serverConfig);
@@ -77,6 +113,15 @@ export async function ensureDatabaseExists(
     if (conn) {
       await conn.end();
     }
+  }
+}
+
+export async function ensureDatabaseExists(
+  overrideConfig: Partial<PoolConfig> = {}
+): Promise<void> {
+  const exists = await checkDatabaseExists(overrideConfig);
+  if (!exists) {
+    await createDatabase(overrideConfig);
   }
 }
 
