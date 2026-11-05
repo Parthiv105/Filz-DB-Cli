@@ -29,6 +29,10 @@ export type DataType =
   | "UUID"
   | "CUSTOM";
 
+export type DefaultValueRaw = string | number | boolean | Date | null;
+export type DefaultValueFn = () => DefaultValueRaw;
+export type DefaultValue = DefaultValueRaw | DefaultValueFn;
+
 export interface ColumnDefinition {
   type: DataType;
   customType?: string;
@@ -41,7 +45,7 @@ export interface ColumnDefinition {
   isUnsigned?: boolean;
   charset?: string;
   collation?: string;
-  defaultValue?: string | number | boolean | null;
+  defaultValue?: DefaultValue;
   onUpdate?: string;
   comment?: string;
   renamedFrom?: string;
@@ -114,7 +118,7 @@ export class ColumnBuilder {
     return this;
   }
 
-  default(val: string | number | boolean | null) {
+  default(val: DefaultValue) {
     this.def.defaultValue = val;
     return this;
   }
@@ -262,8 +266,8 @@ export interface FieldOptions {
   auto?: boolean;
   unique?: boolean;
   unsigned?: boolean;
-  default?: string | number | boolean | null;
-  defaultValue?: string | number | boolean | null;
+  default?: DefaultValue;
+  defaultValue?: DefaultValue;
   enum?: string[];
   enumValues?: string[];
   charset?: string;
@@ -492,8 +496,16 @@ export function normalizeFieldDefinition(
       onUpdate = "CURRENT_TIMESTAMP";
     }
 
-    const defaultValue =
+    let defaultValue =
       opts.default !== undefined ? opts.default : opts.defaultValue;
+
+    if (typeof defaultValue === "function") {
+      try {
+        defaultValue = (defaultValue as DefaultValueFn)();
+      } catch {
+        // keep callback
+      }
+    }
 
     return {
       type: baseType,
@@ -592,6 +604,89 @@ export function escapeLiteral(val: string): string {
   return `'${val.replace(/\\/g, "\\\\").replace(/'/g, "''")}'`;
 }
 
+export function formatDateToMySQL(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+export function formatDefaultSQL(rawVal: DefaultValue | undefined): string {
+  if (rawVal === undefined) return "";
+
+  let val = rawVal;
+  if (typeof val === "function") {
+    try {
+      val = (val as DefaultValueFn)();
+    } catch {
+      return "";
+    }
+  }
+
+  if (val === null) {
+    return "DEFAULT NULL";
+  }
+
+  if (val instanceof Date) {
+    return `DEFAULT '${formatDateToMySQL(val)}'`;
+  }
+
+  if (typeof val === "boolean") {
+    return `DEFAULT ${val ? 1 : 0}`;
+  }
+
+  if (typeof val === "number") {
+    return `DEFAULT ${val}`;
+  }
+
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    const upper = trimmed.toUpperCase();
+
+    // Standard unquoted SQL expressions & keywords
+    const unquotedKeywords = [
+      "CURRENT_TIMESTAMP",
+      "CURRENT_TIMESTAMP()",
+      "NOW()",
+      "NOW(6)",
+      "NULL",
+      "TRUE",
+      "FALSE",
+      "UUID()",
+      "CURDATE()",
+      "CURRENT_DATE",
+      "CURRENT_DATE()",
+      "CURTIME()",
+      "CURRENT_TIME",
+      "CURRENT_TIME()",
+      "UTC_TIMESTAMP",
+      "UTC_TIMESTAMP()",
+      "UTC_DATE",
+      "UTC_DATE()",
+      "UTC_TIME",
+      "UTC_TIME()",
+    ];
+
+    if (
+      unquotedKeywords.includes(upper) ||
+      upper.startsWith("CURRENT_TIMESTAMP") ||
+      (trimmed.startsWith("(") && trimmed.endsWith(")"))
+    ) {
+      const cleanSQL =
+        upper === "CURRENT_TIMESTAMP()" ? "CURRENT_TIMESTAMP" : upper;
+      return `DEFAULT ${cleanSQL}`;
+    }
+
+    return `DEFAULT ${escapeLiteral(val)}`;
+  }
+
+  return `DEFAULT ${escapeLiteral(String(val))}`;
+}
+
 export function compileColumnSQL(name: string, column: ColumnDefinition): string {
   let typeSQL = column.customType || column.type;
 
@@ -620,29 +715,7 @@ export function compileColumnSQL(name: string, column: ColumnDefinition): string
 
   const nullSQL = column.nullable ? "NULL" : "NOT NULL";
   const autoIncSQL = column.isAutoIncrement ? "AUTO_INCREMENT" : "";
-
-  let defaultSQL = "";
-  if (column.defaultValue !== undefined) {
-    if (column.defaultValue === null) {
-      defaultSQL = "DEFAULT NULL";
-    } else if (typeof column.defaultValue === "string") {
-      const upper = column.defaultValue.toUpperCase();
-      if (
-        upper === "CURRENT_TIMESTAMP" ||
-        upper === "CURRENT_TIMESTAMP()" ||
-        upper === "NOW()" ||
-        upper === "NULL"
-      ) {
-        defaultSQL = `DEFAULT ${upper.replace("()", "")}`;
-      } else {
-        defaultSQL = `DEFAULT ${escapeLiteral(column.defaultValue)}`;
-      }
-    } else if (typeof column.defaultValue === "boolean") {
-      defaultSQL = `DEFAULT ${column.defaultValue ? 1 : 0}`;
-    } else {
-      defaultSQL = `DEFAULT ${Number(column.defaultValue)}`;
-    }
-  }
+  const defaultSQL = formatDefaultSQL(column.defaultValue);
 
   const onUpdateSQL = column.onUpdate ? `ON UPDATE ${column.onUpdate}` : "";
   const commentSQL = column.comment

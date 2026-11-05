@@ -18,12 +18,41 @@ import {
 } from "./schemaInspector.js";
 import { computeTableDiff } from "./schemaDiff.js";
 import type { ExistingColumnStrategy } from "./schemaDiff.js";
+import {
+  findConfigFile,
+  loadConfigFile,
+  resolveModelsFromConfig,
+  parseDatabaseConfig,
+  extractTablesFromModule,
+} from "./config.js";
+import type { ModelerConfig } from "./config.js";
 
 export async function runCli(): Promise<void> {
   const cwd = process.cwd();
 
-  // Load .env from target project directory
-  const envPath = path.resolve(cwd, ".env");
+  const args = process.argv.slice(2);
+
+  // Check for explicit config path
+  let explicitConfigPath: string | undefined;
+  const configArgIdx = args.indexOf("--config");
+  if (configArgIdx !== -1 && args[configArgIdx + 1]) {
+    explicitConfigPath = args[configArgIdx + 1];
+  }
+
+  // Discover and load modaler.config.ts / modeler.config.ts if present
+  const configFile = findConfigFile(cwd, explicitConfigPath);
+  let loadedConfig: ModelerConfig | null = null;
+  if (configFile) {
+    try {
+      loadedConfig = await loadConfigFile(configFile);
+    } catch (err: unknown) {
+      const msg = (err as Error)?.message || String(err);
+      console.warn(pc.yellow(`Warning: Failed to load config ${configFile}: ${msg}`));
+    }
+  }
+
+  // Load .env from target project directory or config.envPath
+  const envPath = path.resolve(cwd, loadedConfig?.envPath || ".env");
   if (fs.existsSync(envPath) && typeof process.loadEnvFile === "function") {
     try {
       process.loadEnvFile(envPath);
@@ -31,13 +60,12 @@ export async function runCli(): Promise<void> {
       // ignore
     }
   }
-
-  const args = process.argv.slice(2);
   const isCreateFlag = args.includes("--create") || args.includes("--sync");
   const isAlterFlag = args.includes("--alter");
   const isDeleteFlag = args.includes("--delete") || args.includes("--drop-table");
   const isDryRunFlag = args.includes("--dry-run");
-  const isDropFlag = args.includes("--drop");
+  const isDropFlag =
+    args.includes("--drop") || Boolean(loadedConfig?.dropColumns);
   const isHardFlag = args.includes("--hard") || args.includes("--hard-alter");
   const isKeepNamesFlag =
     args.includes("--keep-names") ||
@@ -69,53 +97,73 @@ export async function runCli(): Promise<void> {
   try {
     p.intro(pc.bgCyan(pc.black(" DB Modeler CLI ")));
 
-    // Discover models in project directory
-    const modelCandidates: string[] = [
-      path.resolve(cwd, "src/Utils/Database/MariaDB/index.ts"),
-      path.resolve(cwd, "src/Utils/Database/MariaDB/index.js"),
-      path.resolve(cwd, "src/Utils/Database/MariaDB/models.ts"),
-      path.resolve(cwd, "src/Utils/Database/MariaDB/models.js"),
-      path.resolve(cwd, "src/database/index.ts"),
-      path.resolve(cwd, "src/database/index.js"),
-      path.resolve(cwd, "src/models/index.ts"),
-      path.resolve(cwd, "src/models/index.js"),
-      path.resolve(cwd, "src/db/index.ts"),
-      path.resolve(cwd, "src/db/index.js"),
-    ];
-
-    const modelsFlagIdx = args.indexOf("--models");
-    if (modelsFlagIdx !== -1 && args[modelsFlagIdx + 1]) {
-      modelCandidates.unshift(path.resolve(cwd, args[modelsFlagIdx + 1]));
+    if (configFile) {
+      const relPath = path.relative(cwd, configFile);
+      p.log.info(pc.dim(`Loaded config from ${relPath}`));
     }
 
-    const modelFilePath = modelCandidates.find((f) => fs.existsSync(f));
-
-    if (!modelFilePath && !isDeleteFlag) {
-      p.log.error(
-        `Could not find models registry in project. Checked:\n  - ${modelCandidates.slice(0, 4).join("\n  - ")}\n\nYou can specify a custom path using --models <path>`
-      );
-      p.outro(pc.red("Exiting..."));
-      process.exit(1);
-    }
-
+    // Resolve models:
+    // 1. From modaler.config.ts if present (relative to config file or cwd)
+    // 2. From candidate directories or --models <path>
     let models: TableDefinition[] = [];
-    if (modelFilePath) {
-      const imported = await import(pathToFileURL(modelFilePath).href);
-      models = imported.models || [];
+
+    if (loadedConfig?.models && configFile) {
+      models = await resolveModelsFromConfig(
+        loadedConfig.models,
+        cwd,
+        path.dirname(configFile)
+      );
+    } else if (loadedConfig?.models) {
+      models = await resolveModelsFromConfig(loadedConfig.models, cwd);
+    }
+
+    if (models.length === 0) {
+      const modelCandidates: string[] = [
+        path.resolve(cwd, "src/Utils/Database/MariaDB/index.ts"),
+        path.resolve(cwd, "src/Utils/Database/MariaDB/index.js"),
+        path.resolve(cwd, "src/Utils/Database/MariaDB/models.ts"),
+        path.resolve(cwd, "src/Utils/Database/MariaDB/models.js"),
+        path.resolve(cwd, "src/database/index.ts"),
+        path.resolve(cwd, "src/database/index.js"),
+        path.resolve(cwd, "src/models/index.ts"),
+        path.resolve(cwd, "src/models/index.js"),
+        path.resolve(cwd, "src/db/index.ts"),
+        path.resolve(cwd, "src/db/index.js"),
+      ];
+
+      const modelsFlagIdx = args.indexOf("--models");
+      if (modelsFlagIdx !== -1 && args[modelsFlagIdx + 1]) {
+        modelCandidates.unshift(path.resolve(cwd, args[modelsFlagIdx + 1]));
+      }
+
+      const modelFilePath = modelCandidates.find((f) => fs.existsSync(f));
+
+      if (modelFilePath) {
+        const imported = await import(pathToFileURL(modelFilePath).href);
+        models = extractTablesFromModule(imported);
+      } else if (!isDeleteFlag) {
+        p.log.error(
+          `Could not find model definitions. You can:\n  1. Create a ${pc.cyan("modaler.config.ts")} file with ${pc.cyan("withModaler({ models: [...] })")}\n  2. Export models in: ${modelCandidates.slice(0, 3).join("\n     ")}\n  3. Specify a custom path with --models <path>`
+        );
+        p.outro(pc.red("Exiting..."));
+        process.exit(1);
+      }
     }
 
     if ((!models || models.length === 0) && !isDeleteFlag) {
-      p.log.warn(`No models exported in: ${modelFilePath}`);
+      p.log.warn(`No models defined in configuration or model file.`);
       p.outro(pc.dim("Exiting..."));
       process.exit(0);
     }
+
+    const dbOverrides = parseDatabaseConfig(loadedConfig?.database);
 
     // Connect to MariaDB and check database existence
     const connSpinner = p.spinner();
     connSpinner.start("Connecting to MariaDB...");
 
-    const targetDbName = getResolvedDatabaseName();
-    const dbExists = await checkDatabaseExists();
+    const targetDbName = getResolvedDatabaseName(dbOverrides);
+    const dbExists = await checkDatabaseExists(dbOverrides);
 
     if (!dbExists) {
       connSpinner.stop(pc.yellow(`Database '${targetDbName}' does not exist.`));
@@ -123,7 +171,7 @@ export async function runCli(): Promise<void> {
       const isInteractivePrompt = !isNonInteractive && Boolean(process.stdin.isTTY);
       if (!isInteractivePrompt) {
         p.log.warn(`Database '${targetDbName}' not found. Creating in non-interactive mode...`);
-        await createDatabase();
+        await createDatabase(dbOverrides);
       } else {
         const shouldCreate = await p.confirm({
           message: `Database '${targetDbName}' does not exist. Would you like to create it now?`,
@@ -137,7 +185,7 @@ export async function runCli(): Promise<void> {
 
         const createSpinner = p.spinner();
         createSpinner.start(`Creating database '${targetDbName}'...`);
-        await createDatabase();
+        await createDatabase(dbOverrides);
         createSpinner.stop(pc.green(`Database '${targetDbName}' created successfully!`));
       }
     } else {
@@ -146,7 +194,7 @@ export async function runCli(): Promise<void> {
 
     const fetchSpinner = p.spinner();
     fetchSpinner.start("Fetching live database tables...");
-    pool = createDatabasePool();
+    pool = createDatabasePool(dbOverrides);
     const liveTableNames = await fetchAllTables(pool);
 
     fetchSpinner.stop(

@@ -88,13 +88,37 @@ export const usersTable = defineTable("users", {
 });
 ```
 
-### 2. Export All Models (`src/Utils/Database/MariaDB/index.ts`)
+### 2. Configure via `modaler.config.ts` (Recommended)
+
+Create `modaler.config.ts` (or `modeler.config.ts`) **anywhere in your project** — in the project root, `src/`, `config/`, `src/config/`, `src/database/`, or any custom subfolder. The CLI will automatically discover it:
 
 ```ts
-import { usersTable } from "./users.js";
+import { withModaler } from "@bossdev/db-modeler";
+import { usersTable } from "./src/models/users.js";
 
-export const models = [usersTable];
+export default withModaler({
+  // Import models directly from wherever you create them:
+  models: [usersTable],
+
+  // Optional: database credentials (or define them in .env)
+  database: {
+    host: "127.0.0.1",
+    user: "root",
+    password: "",
+    database: "my_database",
+  },
+});
 ```
+
+You can also pass glob patterns or file paths (automatically resolved relative to the config file):
+
+```ts
+export default withModaler({
+  models: "./src/**/*.model.ts",
+});
+```
+
+*(Alternatively, you can export `models = [...]` from `src/Utils/Database/MariaDB/index.ts` or `src/models/index.ts` without a config file).*
 
 ### 3. Run the CLI
 

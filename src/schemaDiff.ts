@@ -1,4 +1,4 @@
-import { compileColumnSQL, escapeId } from "./schemaBuilder.js";
+import { compileColumnSQL, escapeId, formatDateToMySQL } from "./schemaBuilder.js";
 import type { ColumnDefinition, TableDefinition } from "./schemaBuilder.js";
 import type { LiveColumnInfo, LiveIndexInfo } from "./schemaInspector.js";
 
@@ -111,14 +111,25 @@ function isColumnDifferent(
   }
 
   if (modelDef.defaultValue !== undefined) {
+    let rawVal = modelDef.defaultValue;
+    if (typeof rawVal === "function") {
+      try {
+        rawVal = rawVal();
+      } catch {
+        // ignore
+      }
+    }
+
     const modelDefaultStr =
-      modelDef.defaultValue === null
+      rawVal === null
         ? null
-        : typeof modelDef.defaultValue === "boolean"
-          ? modelDef.defaultValue
+        : typeof rawVal === "boolean"
+          ? rawVal
             ? "1"
             : "0"
-          : String(modelDef.defaultValue);
+          : rawVal instanceof Date
+            ? formatDateToMySQL(rawVal)
+            : String(rawVal);
 
     if (normalizeDefault(modelDefaultStr) !== normalizeDefault(liveCol.defaultValue)) {
       return true;
