@@ -18,8 +18,7 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "cli": "node bin/cli.mjs",
-    "publish": "node scripts/publish.mjs",
-    "release": "node scripts/publish.mjs"
+    "publish": "node scripts/publish.mjs"
   },
   "publishConfig": {
     "access": "public"
