@@ -16,6 +16,15 @@ export interface LiveIndexInfo {
   nonUnique: number;
 }
 
+export interface LiveForeignKeyInfo {
+  constraintName: string;
+  columnName: string;
+  referencedTable: string;
+  referencedColumn: string;
+  onDelete: string;
+  onUpdate: string;
+}
+
 export interface DatabaseExecutor {
   query: <T = unknown>(sql: string, values?: unknown[]) => Promise<T>;
 }
@@ -116,6 +125,43 @@ export async function fetchTableIndexes(
     indexName: r.INDEX_NAME,
     columnName: r.COLUMN_NAME,
     nonUnique: Number(r.NON_UNIQUE),
+  }));
+}
+
+export async function fetchTableForeignKeys(
+  db: DatabaseExecutor,
+  tableName: string,
+  databaseName?: string
+): Promise<LiveForeignKeyInfo[]> {
+  const schemaCondition = databaseName
+    ? "kcu.TABLE_SCHEMA = ?"
+    : "kcu.TABLE_SCHEMA = DATABASE()";
+  const params = databaseName ? [databaseName, tableName] : [tableName];
+
+  const query = `SELECT 
+    kcu.CONSTRAINT_NAME as constraintName,
+    kcu.COLUMN_NAME as columnName,
+    kcu.REFERENCED_TABLE_NAME as referencedTable,
+    kcu.REFERENCED_COLUMN_NAME as referencedColumn,
+    rc.DELETE_RULE as onDelete,
+    rc.UPDATE_RULE as onUpdate
+  FROM information_schema.KEY_COLUMN_USAGE kcu
+  JOIN information_schema.REFERENTIAL_CONSTRAINTS rc 
+    ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME 
+    AND kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+  WHERE ${schemaCondition} AND kcu.TABLE_NAME = ?
+    AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+  ORDER BY kcu.ORDINAL_POSITION`;
+
+  const rows = await db.query<any[]>(query, params);
+
+  return (rows || []).map((r) => ({
+    constraintName: String(r.constraintName ?? r.CONSTRAINT_NAME ?? ""),
+    columnName: String(r.columnName ?? r.COLUMN_NAME ?? ""),
+    referencedTable: String(r.referencedTable ?? r.REFERENCED_TABLE_NAME ?? ""),
+    referencedColumn: String(r.referencedColumn ?? r.REFERENCED_COLUMN_NAME ?? ""),
+    onDelete: String(r.onDelete ?? r.DELETE_RULE ?? "RESTRICT").toUpperCase(),
+    onUpdate: String(r.onUpdate ?? r.UPDATE_RULE ?? "CASCADE").toUpperCase(),
   }));
 }
 

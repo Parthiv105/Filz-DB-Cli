@@ -1,6 +1,6 @@
 {
   "name": "@bossdev/db-modeler",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Declarative MariaDB schema synchronizer & migration CLI with interactive UI",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,6 +17,7 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
+    "test": "tsx --test tests/**/*.test.ts",
     "cli": "node bin/cli.js",
     "publish": "node scripts/publish.mjs"
   },

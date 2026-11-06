@@ -9,12 +9,18 @@ import {
   createDatabasePool,
   getResolvedDatabaseName,
 } from "./db.js";
-import { compileCreateTableSQL, escapeId } from "./schemaBuilder.js";
+import {
+  compileCreateTableSQL,
+  compileAddForeignKeySQL,
+  resolveForeignKeyReferences,
+  escapeId,
+} from "./schemaBuilder.js";
 import type { TableDefinition } from "./schemaBuilder.js";
 import {
   fetchAllTables,
   fetchTableColumns,
   fetchTableIndexes,
+  fetchTableForeignKeys,
 } from "./schemaInspector.js";
 import { computeTableDiff } from "./schemaDiff.js";
 import type { ExistingColumnStrategy } from "./schemaDiff.js";
@@ -154,6 +160,10 @@ export async function runCli(): Promise<void> {
       p.log.warn(`No models defined in configuration or model file.`);
       p.outro(pc.dim("Exiting..."));
       process.exit(0);
+    }
+
+    if (models.length > 0) {
+      resolveForeignKeyReferences(models);
     }
 
     const dbOverrides = parseDatabaseConfig(loadedConfig?.database);
@@ -474,10 +484,16 @@ export async function runCli(): Promise<void> {
     }
 
     // 4. Compute changes, display all changes, and confirm from user
-    const toCreate: { table: TableDefinition; sql: string }[] = [];
+    const toCreate: {
+      table: TableDefinition;
+      createSql: string;
+      fkSqls: string[];
+      descriptions: string[];
+    }[] = [];
     const toAlter: {
       table: TableDefinition;
-      statements: string[];
+      pass1Statements: string[];
+      pass2Statements: string[];
       descriptions: string[];
       warnings: string[];
     }[] = [];
@@ -489,9 +505,31 @@ export async function runCli(): Promise<void> {
         const table = models.find(
           (m) => m.tableName.toLowerCase() === name.toLowerCase()
         )!;
+        const createSql = compileCreateTableSQL(table, {
+          includeForeignKeys: false,
+        });
+        const fkSqls: string[] = [];
+        const descriptions: string[] = [];
+
+        for (const [colName, colDef] of Object.entries(table.columns)) {
+          if (colDef.foreignKey) {
+            fkSqls.push(
+              compileAddForeignKeySQL(table.tableName, colName, colDef.foreignKey)
+            );
+            const targetCol = colDef.foreignKey.column || "Id";
+            const onDel = colDef.foreignKey.onDelete || "RESTRICT";
+            const onUpd = colDef.foreignKey.onUpdate || "CASCADE";
+            descriptions.push(
+              `+ Add foreign key '${colDef.foreignKey.constraintName}' on '${colName}' -> ${colDef.foreignKey.table}(${targetCol}) [ON DELETE ${onDel} ON UPDATE ${onUpd}]`
+            );
+          }
+        }
+
         toCreate.push({
           table,
-          sql: compileCreateTableSQL(table),
+          createSql,
+          fkSqls,
+          descriptions,
         });
       }
     } else if (mode === "alter") {
@@ -500,16 +538,37 @@ export async function runCli(): Promise<void> {
           const table = models.find(
             (m) => m.tableName.toLowerCase() === name.toLowerCase()
           )!;
+          const createSql = compileCreateTableSQL(table, {
+            includeForeignKeys: false,
+          });
+          const fkSqls: string[] = [];
+          const descriptions: string[] = [
+            `! DROP TABLE ${escapeId(table.tableName)} (All existing records will be destroyed)`,
+            `+ CREATE TABLE ${escapeId(table.tableName)} fresh from model schema`,
+          ];
+
+          for (const [colName, colDef] of Object.entries(table.columns)) {
+            if (colDef.foreignKey) {
+              fkSqls.push(
+                compileAddForeignKeySQL(table.tableName, colName, colDef.foreignKey)
+              );
+              const targetCol = colDef.foreignKey.column || "Id";
+              const onDel = colDef.foreignKey.onDelete || "RESTRICT";
+              const onUpd = colDef.foreignKey.onUpdate || "CASCADE";
+              descriptions.push(
+                `+ Add foreign key '${colDef.foreignKey.constraintName}' on '${colName}' -> ${colDef.foreignKey.table}(${targetCol}) [ON DELETE ${onDel} ON UPDATE ${onUpd}]`
+              );
+            }
+          }
+
           toAlter.push({
             table,
-            statements: [
+            pass1Statements: [
               `DROP TABLE IF EXISTS ${escapeId(table.tableName)};`,
-              compileCreateTableSQL(table),
+              createSql,
             ],
-            descriptions: [
-              `! DROP TABLE ${escapeId(table.tableName)} (All existing records will be destroyed)`,
-              `+ CREATE TABLE ${escapeId(table.tableName)} fresh from model schema`,
-            ],
+            pass2Statements: fkSqls,
+            descriptions,
             warnings: [
               `Hard alter permanently drops table '${table.tableName}' and destroys all its data!`,
             ],
@@ -538,16 +597,34 @@ export async function runCli(): Promise<void> {
           )!;
           const liveColumns = await fetchTableColumns(pool, table.tableName);
           const liveIndexes = await fetchTableIndexes(pool, table.tableName);
+          const liveFKs = await fetchTableForeignKeys(pool, table.tableName);
 
-          const diff = computeTableDiff(table, liveColumns, liveIndexes, {
-            dropColumns,
-            strategy: diffStrategy,
-          });
+          const diff = computeTableDiff(
+            table,
+            liveColumns,
+            liveIndexes,
+            {
+              dropColumns,
+              strategy: diffStrategy,
+            },
+            liveFKs
+          );
 
           if (diff.statements.length > 0) {
+            const pass1 = [
+              ...diff.dropForeignKeyStatements,
+              ...diff.statements.filter(
+                (s) =>
+                  !diff.dropForeignKeyStatements.includes(s) &&
+                  !diff.addForeignKeyStatements.includes(s)
+              ),
+            ];
+            const pass2 = diff.addForeignKeyStatements;
+
             toAlter.push({
               table,
-              statements: diff.statements,
+              pass1Statements: pass1,
+              pass2Statements: pass2,
               descriptions: diff.descriptions,
               warnings: diff.warnings,
             });
@@ -570,7 +647,12 @@ export async function runCli(): Promise<void> {
     const totalChanges =
       toCreate.length +
       toDelete.length +
-      toAlter.reduce((acc, curr) => acc + curr.statements.length, 0);
+      toCreate.reduce((acc, curr) => acc + curr.fkSqls.length, 0) +
+      toAlter.reduce(
+        (acc, curr) =>
+          acc + curr.pass1Statements.length + curr.pass2Statements.length,
+        0
+      );
 
     if (totalChanges === 0) {
       if (upToDateTables.length > 0) {
@@ -594,6 +676,9 @@ export async function runCli(): Promise<void> {
         summaryLines.push(
           `  + CREATE TABLE ${pc.cyan(item.table.tableName)} (${Object.keys(item.table.columns).length} columns)`
         );
+        for (const desc of item.descriptions) {
+          summaryLines.push(`    ${pc.dim(desc)}`);
+        }
       }
       summaryLines.push("");
     }
@@ -609,7 +694,15 @@ export async function runCli(): Promise<void> {
       for (const item of toAlter) {
         summaryLines.push(`  Table ${pc.cyan(item.table.tableName)}:`);
         for (const desc of item.descriptions) {
-          summaryLines.push(`    ${desc}`);
+          if (desc.startsWith("+")) {
+            summaryLines.push(`    ${pc.green(desc)}`);
+          } else if (desc.startsWith("-")) {
+            summaryLines.push(`    ${pc.red(desc)}`);
+          } else if (desc.startsWith("~")) {
+            summaryLines.push(`    ${pc.yellow(desc)}`);
+          } else {
+            summaryLines.push(`    ${desc}`);
+          }
         }
         for (const warn of item.warnings) {
           summaryLines.push(`    ${pc.red(`[WARN] ${warn}`)}`);
@@ -637,14 +730,34 @@ export async function runCli(): Promise<void> {
     p.note(summaryLines.join("\n").trim(), "Proposed Schema Changes");
 
     const allSqlLines: string[] = [];
+    if (toDelete.length > 0) {
+      allSqlLines.push("-- Tables to drop");
+      for (const item of toDelete) {
+        allSqlLines.push(item.sql);
+      }
+    }
+    if (toCreate.length > 0) {
+      allSqlLines.push("-- Pass 1: Create base tables");
+      for (const item of toCreate) {
+        allSqlLines.push(item.createSql);
+      }
+    }
+    if (toAlter.length > 0) {
+      allSqlLines.push("-- Pass 1: Table alterations & column changes");
+      for (const item of toAlter) {
+        allSqlLines.push(...item.pass1Statements);
+      }
+    }
+    const allPass2Sql: string[] = [];
     for (const item of toCreate) {
-      allSqlLines.push(item.sql);
+      allPass2Sql.push(...item.fkSqls);
     }
     for (const item of toAlter) {
-      allSqlLines.push(...item.statements);
+      allPass2Sql.push(...item.pass2Statements);
     }
-    for (const item of toDelete) {
-      allSqlLines.push(item.sql);
+    if (allPass2Sql.length > 0) {
+      allSqlLines.push("-- Pass 2: Foreign key constraints");
+      allSqlLines.push(...allPass2Sql);
     }
 
     p.note(allSqlLines.join("\n\n"), "Generated SQL Preview");
@@ -680,27 +793,57 @@ export async function runCli(): Promise<void> {
     }
 
     const execSpinner = p.spinner();
-    execSpinner.start("Applying schema changes to MariaDB...");
+    execSpinner.start("Applying schema changes to MariaDB (Two-Pass Execution)...");
 
-    for (const item of toCreate) {
-      await pool.query(item.sql);
-      p.log.success(`Created table '${item.table.tableName}'`);
-    }
+    const conn = await pool.getConnection();
+    try {
+      await conn.query("SET FOREIGN_KEY_CHECKS = 0;");
 
-    for (const item of toAlter) {
-      for (const sql of item.statements) {
-        await pool.query(sql);
+      // Pass 1: Drops & Base tables & Columns
+      for (const item of toDelete) {
+        await conn.query(item.sql);
+        p.log.success(`Dropped table '${item.tableName}'`);
       }
-      if (alterOption === "hard") {
-        p.log.success(`Dropped and recreated table '${item.table.tableName}'`);
-      } else {
-        p.log.success(`Altered table '${item.table.tableName}'`);
-      }
-    }
 
-    for (const item of toDelete) {
-      await pool.query(item.sql);
-      p.log.success(`Dropped table '${item.tableName}'`);
+      for (const item of toCreate) {
+        await conn.query(item.createSql);
+        p.log.success(`Created base table '${item.table.tableName}'`);
+      }
+
+      for (const item of toAlter) {
+        for (const sql of item.pass1Statements) {
+          await conn.query(sql);
+        }
+        if (alterOption === "hard") {
+          p.log.success(`Dropped and recreated table '${item.table.tableName}'`);
+        } else if (item.pass1Statements.length > 0) {
+          p.log.success(`Altered table structure for '${item.table.tableName}'`);
+        }
+      }
+
+      // Pass 2: Apply Foreign Key Constraints
+      let addedFkCount = 0;
+      for (const item of toCreate) {
+        for (const sql of item.fkSqls) {
+          await conn.query(sql);
+          addedFkCount++;
+        }
+      }
+
+      for (const item of toAlter) {
+        for (const sql of item.pass2Statements) {
+          await conn.query(sql);
+          addedFkCount++;
+        }
+      }
+
+      if (addedFkCount > 0) {
+        p.log.success(`Applied ${addedFkCount} foreign key constraint(s)`);
+      }
+
+      await conn.query("SET FOREIGN_KEY_CHECKS = 1;");
+    } finally {
+      conn.release();
     }
 
     execSpinner.stop("All changes successfully executed!");

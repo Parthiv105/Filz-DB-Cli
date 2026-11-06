@@ -1,6 +1,20 @@
-import { compileColumnSQL, escapeId, formatDateToMySQL } from "./schemaBuilder.js";
-import type { ColumnDefinition, TableDefinition } from "./schemaBuilder.js";
-import type { LiveColumnInfo, LiveIndexInfo } from "./schemaInspector.js";
+import {
+  compileColumnSQL,
+  escapeId,
+  formatDateToMySQL,
+  compileAddForeignKeySQL,
+  compileDropForeignKeySQL,
+} from "./schemaBuilder.js";
+import type {
+  ColumnDefinition,
+  TableDefinition,
+  ForeignKeyConfig,
+} from "./schemaBuilder.js";
+import type {
+  LiveColumnInfo,
+  LiveIndexInfo,
+  LiveForeignKeyInfo,
+} from "./schemaInspector.js";
 
 export type ExistingColumnStrategy =
   | "both"
@@ -17,6 +31,7 @@ export interface DiffOptions {
   keepNames?: boolean;
   ignoreExisting?: boolean;
   namesOnly?: boolean;
+  liveForeignKeys?: LiveForeignKeyInfo[];
 }
 
 export interface TableDiffResult {
@@ -24,6 +39,8 @@ export interface TableDiffResult {
   statements: string[];
   descriptions: string[];
   warnings: string[];
+  dropForeignKeyStatements: string[];
+  addForeignKeyStatements: string[];
 }
 
 const COMMON_ALIASES: Record<string, string[]> = {
@@ -143,7 +160,8 @@ export function computeTableDiff(
   table: TableDefinition,
   liveColumns: Record<string, LiveColumnInfo>,
   liveIndexes: LiveIndexInfo[],
-  options: DiffOptions = {}
+  options: DiffOptions = {},
+  liveForeignKeys?: LiveForeignKeyInfo[]
 ): TableDiffResult {
   const statements: string[] = [];
   const descriptions: string[] = [];
@@ -152,6 +170,7 @@ export function computeTableDiff(
   const modelColEntries = Object.entries(table.columns);
   const liveColNames = Object.keys(liveColumns);
   const matchedLiveCols = new Set<string>();
+  const modelToLiveColMap = new Map<string, string>();
 
   for (const [modelName, def] of modelColEntries) {
     let matchedLiveName: string | null = null;
@@ -208,6 +227,7 @@ export function computeTableDiff(
 
     if (matchedLiveName) {
       matchedLiveCols.add(matchedLiveName);
+      modelToLiveColMap.set(modelName, matchedLiveName);
       const liveCol = liveColumns[matchedLiveName];
 
       const shouldIgnore =
@@ -325,11 +345,119 @@ export function computeTableDiff(
     }
   }
 
+  // --- Foreign Key Diffs ---
+  const actualLiveFKs = liveForeignKeys || options.liveForeignKeys || [];
+  const dropForeignKeyStatements: string[] = [];
+  const addForeignKeyStatements: string[] = [];
+  const fkDescriptions: string[] = [];
+  const matchedLiveFKNames = new Set<string>();
+
+  for (const [modelName, def] of modelColEntries) {
+    if (def.foreignKey) {
+      const fk = def.foreignKey;
+      const targetTable = fk.table;
+      const targetCol = fk.column || "Id";
+      const onDel = ((fk.onDelete || "RESTRICT") as string).toUpperCase();
+      const onUpd = ((fk.onUpdate || "CASCADE") as string).toUpperCase();
+      const constraintName =
+        fk.constraintName || `fk_${table.tableName}_${modelName}_${targetTable}`;
+
+      const matchedLiveCol = modelToLiveColMap.get(modelName);
+
+      const matchingLive = actualLiveFKs.find(
+        (lfk) =>
+          lfk.constraintName.toLowerCase() === constraintName.toLowerCase() ||
+          lfk.columnName.toLowerCase() === modelName.toLowerCase() ||
+          (matchedLiveCol &&
+            lfk.columnName.toLowerCase() === matchedLiveCol.toLowerCase()) ||
+          (def.renamedFrom &&
+            lfk.columnName.toLowerCase() === def.renamedFrom.toLowerCase())
+      );
+
+      if (matchingLive) {
+        matchedLiveFKNames.add(matchingLive.constraintName.toLowerCase());
+
+        const sameTable =
+          matchingLive.referencedTable.toLowerCase() === targetTable.toLowerCase();
+        const sameColumn =
+          matchingLive.referencedColumn.toLowerCase() === targetCol.toLowerCase();
+        const sameDelete = matchingLive.onDelete.toUpperCase() === onDel;
+        const sameUpdate = matchingLive.onUpdate.toUpperCase() === onUpd;
+
+        if (!sameTable || !sameColumn || !sameDelete || !sameUpdate) {
+          dropForeignKeyStatements.push(
+            compileDropForeignKeySQL(table.tableName, matchingLive.constraintName)
+          );
+          addForeignKeyStatements.push(
+            compileAddForeignKeySQL(table.tableName, modelName, {
+              ...fk,
+              constraintName,
+            })
+          );
+          fkDescriptions.push(
+            `~ Update foreign key on '${modelName}': ${matchingLive.referencedTable}(${matchingLive.referencedColumn}) [${matchingLive.onDelete}/${matchingLive.onUpdate}] -> ${targetTable}(${targetCol}) [${onDel}/${onUpd}]`
+          );
+        }
+      } else {
+        addForeignKeyStatements.push(
+          compileAddForeignKeySQL(table.tableName, modelName, {
+            ...fk,
+            constraintName,
+          })
+        );
+        fkDescriptions.push(
+          `+ Add foreign key '${constraintName}' on '${modelName}' -> ${targetTable}(${targetCol}) [ON DELETE ${onDel} ON UPDATE ${onUpd}]`
+        );
+      }
+    }
+  }
+
+  // Check for foreign keys present in live DB but removed from model
+  for (const liveFK of actualLiveFKs) {
+    if (!matchedLiveFKNames.has(liveFK.constraintName.toLowerCase())) {
+      const colInModel = modelColEntries.find(
+        ([cName, cDef]) =>
+          cName.toLowerCase() === liveFK.columnName.toLowerCase() ||
+          cDef.renamedFrom?.toLowerCase() === liveFK.columnName.toLowerCase() ||
+          (modelToLiveColMap.get(cName)?.toLowerCase() ===
+            liveFK.columnName.toLowerCase())
+      );
+
+      if (colInModel) {
+        // Column exists in model, but does NOT have a foreignKey definition (ref removed)
+        dropForeignKeyStatements.push(
+          compileDropForeignKeySQL(table.tableName, liveFK.constraintName)
+        );
+        fkDescriptions.push(
+          `- Drop foreign key '${liveFK.constraintName}' on '${liveFK.columnName}' (removed from model)`
+        );
+      } else if (options.dropColumns) {
+        // Column is being dropped, drop foreign key constraint first
+        dropForeignKeyStatements.push(
+          compileDropForeignKeySQL(table.tableName, liveFK.constraintName)
+        );
+        fkDescriptions.push(
+          `- Drop foreign key '${liveFK.constraintName}' on dropped column '${liveFK.columnName}'`
+        );
+      } else {
+        warnings.push(
+          `Foreign key '${liveFK.constraintName}' exists on unmanaged column '${liveFK.columnName}' (use --drop to remove)`
+        );
+      }
+    }
+  }
+
   return {
     tableName: table.tableName,
-    statements,
-    descriptions,
+    statements: [
+      ...dropForeignKeyStatements,
+      ...statements,
+      ...addForeignKeyStatements,
+    ],
+    descriptions: [...descriptions, ...fkDescriptions],
     warnings,
+    dropForeignKeyStatements,
+    addForeignKeyStatements,
   };
 }
 

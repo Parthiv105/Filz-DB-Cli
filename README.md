@@ -302,6 +302,64 @@ export const ordersTable = defineTable("Orders", {
 
 ---
 
+### Foreign Keys & Relations (`ref`)
+
+`@bossdev/db-modeler` supports declarative, Mongoose-style Foreign Key references (`ref`) across schema definitions, table creation DDL, database inspection, and two-pass migration diffing.
+
+#### 1. Mongoose-Style Shorthand (String)
+Specify the target table name as a string. If the target column is omitted, it automatically resolves to the target table's Primary Key (such as `UID` or `Id`):
+
+```ts
+export const workspacesTable = defineTable("Workspaces", {
+  Id: col.int().autoIncrement().primaryKey(),
+  OwnerUID: {
+    type: "UUID",
+    required: true,
+    ref: "Users", // Auto-resolves target table's PK / UID
+  },
+});
+```
+
+#### 2. Detailed Object Syntax
+Configure custom cascade rules (`onDelete` and `onUpdate`) and custom constraint names:
+
+```ts
+export const workspacesTable = defineTable("Workspaces", {
+  Id: col.int().autoIncrement().primaryKey(),
+  OwnerUID: {
+    type: "UUID",
+    required: true,
+    ref: {
+      table: "Users",
+      column: "UID",                                 // Target column in foreign table
+      onDelete: "RESTRICT",                          // "CASCADE" | "RESTRICT" | "SET NULL" | "NO ACTION" (default: "RESTRICT")
+      onUpdate: "CASCADE",                           // default: "CASCADE"
+      constraintName: "fk_Workspaces_OwnerUID_Users" // Optional custom name
+    },
+  },
+});
+```
+
+#### 3. Fluent Column Builder (`col.ref()`)
+
+```ts
+export const workspacesTable = defineTable("Workspaces", {
+  Id: col.int().autoIncrement().primaryKey(),
+  OwnerUID: col
+    .uuid()
+    .notNull()
+    .ref("Users", "UID", { onDelete: "CASCADE", onUpdate: "CASCADE" }),
+});
+```
+
+#### 4. Two-Pass Migration Engine (Zero Circular Dependency Deadlocks)
+When running migrations across interconnected or circular tables (e.g. `Users` references `Workspaces` while `Workspaces` references `Users`):
+- **Pass 1**: Creates all base tables and modifies columns (without foreign key constraints).
+- **Pass 2**: Applies `ALTER TABLE ... ADD CONSTRAINT FOREIGN KEY ...` after all referenced tables exist.
+This guarantees circular references and cross-table relations apply safely without constraint check failures.
+
+---
+
 ### Column Type Reference
 
 | Type Builder | Declarative Type | Output MariaDB / MySQL SQL | Description |

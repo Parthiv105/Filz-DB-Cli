@@ -33,6 +33,26 @@ export type DefaultValueRaw = string | number | boolean | Date | null;
 export type DefaultValueFn = () => DefaultValueRaw;
 export type DefaultValue = DefaultValueRaw | DefaultValueFn;
 
+export type ReferentialAction =
+  | "CASCADE"
+  | "RESTRICT"
+  | "SET NULL"
+  | "NO ACTION"
+  | "cascade"
+  | "restrict"
+  | "set null"
+  | "no action";
+
+export interface ForeignKeyConfig {
+  table: string;
+  column?: string; // Defaults to "Id" or target table's primary key
+  onDelete?: ReferentialAction;
+  onUpdate?: ReferentialAction;
+  constraintName?: string;
+}
+
+export type ReferenceInput = string | ForeignKeyConfig;
+
 export interface ColumnDefinition {
   type: DataType;
   customType?: string;
@@ -51,6 +71,7 @@ export interface ColumnDefinition {
   renamedFrom?: string;
   keepName?: boolean;
   ignoreExisting?: boolean;
+  foreignKey?: ForeignKeyConfig;
 }
 
 export class ColumnBuilder {
@@ -156,6 +177,89 @@ export class ColumnBuilder {
   ignoreExisting() {
     this.def.ignoreExisting = true;
     return this;
+  }
+
+  ref(
+    tableOrConfig: string | ForeignKeyConfig,
+    columnOrOptions?:
+      | string
+      | {
+          onDelete?: ReferentialAction;
+          onUpdate?: ReferentialAction;
+          name?: string;
+          constraintName?: string;
+        },
+    options?: {
+      onDelete?: ReferentialAction;
+      onUpdate?: ReferentialAction;
+      name?: string;
+      constraintName?: string;
+    }
+  ): this {
+    if (typeof tableOrConfig === "object" && tableOrConfig !== null) {
+      const onDel = (
+        (tableOrConfig.onDelete || "RESTRICT") as string
+      ).toUpperCase() as ReferentialAction;
+      const onUpd = (
+        (tableOrConfig.onUpdate || "CASCADE") as string
+      ).toUpperCase() as ReferentialAction;
+      this.def.foreignKey = {
+        table: tableOrConfig.table,
+        column: tableOrConfig.column || "Id",
+        onDelete: onDel,
+        onUpdate: onUpd,
+        constraintName: tableOrConfig.constraintName,
+      };
+      return this;
+    }
+
+    const table = tableOrConfig;
+    let column = "Id";
+    let opts: {
+      onDelete?: ReferentialAction;
+      onUpdate?: ReferentialAction;
+      name?: string;
+      constraintName?: string;
+    } = {};
+
+    if (typeof columnOrOptions === "string") {
+      column = columnOrOptions;
+      if (options) opts = options;
+    } else if (typeof columnOrOptions === "object" && columnOrOptions !== null) {
+      opts = columnOrOptions;
+    }
+
+    const onDel = ((opts.onDelete || "RESTRICT") as string).toUpperCase() as ReferentialAction;
+    const onUpd = ((opts.onUpdate || "CASCADE") as string).toUpperCase() as ReferentialAction;
+
+    this.def.foreignKey = {
+      table,
+      column,
+      onDelete: onDel,
+      onUpdate: onUpd,
+      constraintName: opts.name || opts.constraintName,
+    };
+    return this;
+  }
+
+  references(
+    tableOrConfig: string | ForeignKeyConfig,
+    columnOrOptions?:
+      | string
+      | {
+          onDelete?: ReferentialAction;
+          onUpdate?: ReferentialAction;
+          name?: string;
+          constraintName?: string;
+        },
+    options?: {
+      onDelete?: ReferentialAction;
+      onUpdate?: ReferentialAction;
+      name?: string;
+      constraintName?: string;
+    }
+  ): this {
+    return this.ref(tableOrConfig, columnOrOptions, options);
   }
 }
 
@@ -283,6 +387,8 @@ export interface FieldOptions {
   onUpdateCurrentTimestamp?: boolean;
   customType?: string;
   text?: boolean;
+  ref?: ReferenceInput;
+  references?: ReferenceInput;
 }
 
 export type FieldDefinitionInput =
@@ -336,9 +442,19 @@ export class Schema {
 }
 
 export function normalizeFieldDefinition(
-  input: FieldDefinitionInput
+  input: FieldDefinitionInput,
+  columnName?: string,
+  tableName?: string
 ): ColumnDefinition {
   if (input instanceof ColumnBuilder) {
+    if (
+      columnName &&
+      tableName &&
+      input.def.foreignKey &&
+      !input.def.foreignKey.constraintName
+    ) {
+      input.def.foreignKey.constraintName = `fk_${tableName}_${columnName}_${input.def.foreignKey.table}`;
+    }
     return input.def;
   }
 
@@ -507,6 +623,42 @@ export function normalizeFieldDefinition(
       }
     }
 
+    const refInput = opts.ref !== undefined ? opts.ref : opts.references;
+    let foreignKey: ForeignKeyConfig | undefined;
+
+    if (refInput) {
+      if (typeof refInput === "string") {
+        foreignKey = {
+          table: refInput,
+          column: "Id",
+          onDelete: "RESTRICT",
+          onUpdate: "CASCADE",
+          constraintName:
+            columnName && tableName
+              ? `fk_${tableName}_${columnName}_${refInput}`
+              : undefined,
+        };
+      } else if (typeof refInput === "object" && refInput !== null) {
+        const onDel = (
+          (refInput.onDelete || "RESTRICT") as string
+        ).toUpperCase() as ReferentialAction;
+        const onUpd = (
+          (refInput.onUpdate || "CASCADE") as string
+        ).toUpperCase() as ReferentialAction;
+        foreignKey = {
+          table: refInput.table,
+          column: refInput.column || "Id",
+          onDelete: onDel,
+          onUpdate: onUpd,
+          constraintName:
+            refInput.constraintName ||
+            (columnName && tableName
+              ? `fk_${tableName}_${columnName}_${refInput.table}`
+              : undefined),
+        };
+      }
+    }
+
     return {
       type: baseType,
       customType,
@@ -525,6 +677,7 @@ export function normalizeFieldDefinition(
       renamedFrom: opts.from ?? opts.renamedFrom,
       keepName: opts.keepName,
       ignoreExisting: opts.ignoreExisting,
+      foreignKey,
     };
   }
 
@@ -535,6 +688,45 @@ export interface TableDefinition {
   tableName: string;
   columns: Record<string, ColumnDefinition>;
   options?: TableOptions;
+}
+
+export const TABLE_REGISTRY = new Map<string, TableDefinition>();
+
+export function resolveForeignKeyReferences(tables: TableDefinition[]): void {
+  for (const t of tables) {
+    TABLE_REGISTRY.set(t.tableName.toLowerCase(), t);
+  }
+
+  for (const table of tables) {
+    for (const [colName, colDef] of Object.entries(table.columns)) {
+      if (colDef.foreignKey) {
+        const targetTableName = colDef.foreignKey.table;
+        const targetTable = TABLE_REGISTRY.get(targetTableName.toLowerCase());
+
+        if (targetTable) {
+          const targetCols = targetTable.columns;
+          const pkEntry = Object.entries(targetCols).find(
+            ([_, def]) => def.isPrimaryKey
+          );
+
+          if (
+            !colDef.foreignKey.column ||
+            (colDef.foreignKey.column === "Id" && !targetCols["Id"])
+          ) {
+            if (pkEntry) {
+              colDef.foreignKey.column = pkEntry[0];
+            } else if (targetCols["UID"]) {
+              colDef.foreignKey.column = "UID";
+            } else if (targetCols["uid"]) {
+              colDef.foreignKey.column = "uid";
+            } else if (targetCols["id"]) {
+              colDef.foreignKey.column = "id";
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 export function defineTable(
@@ -554,7 +746,22 @@ export function defineTable(
 
   const columns: Record<string, ColumnDefinition> = {};
   for (const key of Object.keys(fields)) {
-    columns[key] = normalizeFieldDefinition(fields[key]);
+    const colDef = normalizeFieldDefinition(fields[key], key, tableName);
+    if (colDef.foreignKey) {
+      if (!colDef.foreignKey.column) {
+        colDef.foreignKey.column = "Id";
+      }
+      if (!colDef.foreignKey.onDelete) {
+        colDef.foreignKey.onDelete = "RESTRICT";
+      }
+      if (!colDef.foreignKey.onUpdate) {
+        colDef.foreignKey.onUpdate = "CASCADE";
+      }
+      if (!colDef.foreignKey.constraintName) {
+        colDef.foreignKey.constraintName = `fk_${tableName}_${key}_${colDef.foreignKey.table}`;
+      }
+    }
+    columns[key] = colDef;
   }
 
   // Handle timestamps: true (Mongoose-style)
@@ -588,7 +795,10 @@ export function defineTable(
     }
   }
 
-  return { tableName, columns, options: mergedOptions };
+  const tableDef: TableDefinition = { tableName, columns, options: mergedOptions };
+  TABLE_REGISTRY.set(tableName.toLowerCase(), tableDef);
+  resolveForeignKeyReferences([tableDef]);
+  return tableDef;
 }
 
 // Aliases matching Mongoose / MongoDB convention
@@ -735,10 +945,42 @@ export function compileColumnSQL(name: string, column: ColumnDefinition): string
     .join(" ");
 }
 
-export function compileCreateTableSQL(table: TableDefinition): string {
+export function compileForeignKeyConstraint(
+  tableName: string,
+  colName: string,
+  fk: ForeignKeyConfig
+): string {
+  const cName = fk.constraintName || `fk_${tableName}_${colName}_${fk.table}`;
+  const targetCol = fk.column || "Id";
+  const onDel = ((fk.onDelete || "RESTRICT") as string).toUpperCase();
+  const onUpd = ((fk.onUpdate || "CASCADE") as string).toUpperCase();
+  return `CONSTRAINT ${escapeId(cName)} FOREIGN KEY (${escapeId(colName)}) REFERENCES ${escapeId(fk.table)} (${escapeId(targetCol)}) ON DELETE ${onDel} ON UPDATE ${onUpd}`;
+}
+
+export function compileAddForeignKeySQL(
+  tableName: string,
+  colName: string,
+  fk: ForeignKeyConfig
+): string {
+  return `ALTER TABLE ${escapeId(tableName)} ADD ${compileForeignKeyConstraint(tableName, colName, fk)};`;
+}
+
+export function compileDropForeignKeySQL(
+  tableName: string,
+  constraintName: string
+): string {
+  return `ALTER TABLE ${escapeId(tableName)} DROP FOREIGN KEY ${escapeId(constraintName)};`;
+}
+
+export function compileCreateTableSQL(
+  table: TableDefinition,
+  options?: { includeForeignKeys?: boolean }
+): string {
+  const includeFKs = options?.includeForeignKeys !== false;
   const colLines: string[] = [];
   const primaryKeys: string[] = [];
   const uniqueKeys: { name: string; col: string }[] = [];
+  const foreignKeys: string[] = [];
 
   for (const colName of Object.keys(table.columns)) {
     const colDef = table.columns[colName];
@@ -751,6 +993,12 @@ export function compileCreateTableSQL(table: TableDefinition): string {
     if (colDef.isUnique) {
       uniqueKeys.push({ name: `uq_${table.tableName}_${colName}`, col: colName });
     }
+
+    if (includeFKs && colDef.foreignKey) {
+      foreignKeys.push(
+        `  ${compileForeignKeyConstraint(table.tableName, colName, colDef.foreignKey)}`
+      );
+    }
   }
 
   if (primaryKeys.length > 0) {
@@ -759,6 +1007,10 @@ export function compileCreateTableSQL(table: TableDefinition): string {
 
   for (const uq of uniqueKeys) {
     colLines.push(`  UNIQUE KEY ${escapeId(uq.name)} (${escapeId(uq.col)})`);
+  }
+
+  for (const fkSQL of foreignKeys) {
+    colLines.push(fkSQL);
   }
 
   const engine = table.options?.engine || "InnoDB";
