@@ -6,8 +6,8 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "db-modeler": "./bin/cli.mjs",
-    "db-modler": "./bin/cli.mjs"
+    "db-modeler": "./bin/cli.js",
+    "db-modler": "./bin/cli.js"
   },
   "files": [
     "dist",
@@ -17,7 +17,7 @@
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build",
-    "cli": "node bin/cli.mjs",
+    "cli": "node bin/cli.js",
     "publish": "node scripts/publish.mjs"
   },
   "publishConfig": {

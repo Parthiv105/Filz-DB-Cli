@@ -230,28 +230,53 @@ async function main() {
   }
 
   // 5. Publish to npm
-  const pubSpinner = p.spinner();
-  pubSpinner.start(`Publishing ${packageName}@${targetVersion} to npm registry...`);
+  p.log.step(`Publishing ${pc.bold(`${packageName}@${targetVersion}`)} to npm...`);
 
-  try {
-    execSync("npm publish --access public", {
-      stdio: "pipe",
-      env: { ...process.env, SMART_PUBLISH_ACTIVE: "1" },
-    });
-    pubSpinner.stop(
-      pc.green(`Published ${pc.bold(`${packageName}@${targetVersion}`)} to npm!`)
+  let publishResult = spawnSync("npm", ["publish", "--access", "public"], {
+    stdio: "inherit",
+    shell: true,
+    env: { ...process.env, SMART_PUBLISH_ACTIVE: "1" },
+  });
+
+  // If publish failed (e.g. requires OTP or interactive 2FA prompt), ask user for OTP
+  if (publishResult.status !== 0) {
+    p.log.warn(
+      pc.yellow("Publish failed or requires a One-Time Password (2FA / OTP).")
     );
-  } catch (err) {
-    pubSpinner.stop(pc.red("npm publish failed."));
-    const errorOutput =
-      err?.stderr?.toString() || err?.stdout?.toString() || String(err);
-    p.log.error(pc.red(errorOutput.trim()));
+    const otp = await p.text({
+      message: "Enter your 6-digit npm 2FA / OTP code (or leave blank to cancel):",
+      placeholder: "123456",
+    });
+
+    if (p.isCancel(otp) || !otp || !otp.trim()) {
+      p.cancel("Publish aborted.");
+      process.exit(1);
+    }
+
+    p.log.step(pc.cyan("Retrying npm publish with provided OTP code..."));
+    publishResult = spawnSync(
+      "npm",
+      ["publish", "--access", "public", `--otp=${otp.trim()}`],
+      {
+        stdio: "inherit",
+        shell: true,
+        env: { ...process.env, SMART_PUBLISH_ACTIVE: "1" },
+      }
+    );
+  }
+
+  if (publishResult.status !== 0) {
+    p.log.error(pc.red(`npm publish failed with exit code ${publishResult.status}.`));
     p.note(
-      "If the version already exists on npm, bump package.json version or check your npm permissions.",
+      "If the version already exists on npm, bump package.json version or check your npm permissions.\nYou can also run manually: npm publish --access public --otp=YOUR_CODE",
       "Troubleshooting"
     );
     process.exit(1);
   }
+
+  p.log.success(
+    pc.green(`Published ${pc.bold(`${packageName}@${targetVersion}`)} to npm!`)
+  );
 
   // 6. Git Tag & Push
   try {
